@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
+import math
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,10 +38,7 @@ def get_od_flows(oa: str):
 
     try:
         response = requests.get(url, params=params, timeout=30)
-        print("Nomis status:", response.status_code)
-        print("Nomis URL:", response.url)
         data = response.json()
-        print("Nomis response keys:", list(data.keys()) if isinstance(data, dict) else "not a dict")
 
         flows = []
         if "obs" in data:
