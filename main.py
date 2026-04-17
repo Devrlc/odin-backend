@@ -185,8 +185,6 @@ def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
 
 @app.get("/api/assign-trips")
 def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = ""):
-    print(f"assign-trips called: pin=({pin_lat},{pin_lng}) radius={radius_m} vehicle_trips={vehicle_trips} flows='{flows}'")
-
     try:
         import osmnx as ox
         import networkx as nx
@@ -196,7 +194,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
         G = ox.add_edge_travel_times(G)
 
         origin_node = ox.nearest_nodes(G, pin_lng, pin_lat)
-        print(f"Origin node: {origin_node}, total nodes: {len(G.nodes)}")
 
         flow_list = []
         if flows:
@@ -208,8 +205,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                     except:
                         pass
 
-        print(f"Parsed {len(flow_list)} flows")
-
         edge_trips = {}
         for u, v, k in G.edges(keys=True):
             edge_trips[(u, v, k)] = 0
@@ -217,7 +212,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
         total_assigned = 0
 
         all_paths = nx.single_source_dijkstra_path(G, origin_node, weight='travel_time')
-        print(f"Reachable nodes: {len(all_paths)}")
 
         for flow in flow_list:
             msoa = flow['msoa']
@@ -236,14 +230,12 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                 centroid_data = centroid_resp.json()
 
                 if not centroid_data.get('features'):
-                    print(f"No centroid for {msoa}")
                     continue
 
                 feature = centroid_data['features'][0]
                 geom = feature.get('geometry', {})
                 dest_lng = geom.get('x')
                 dest_lat = geom.get('y')
-                print(f"Centroid for {msoa}: lat={dest_lat}, lng={dest_lng}")
 
                 if not dest_lat or not dest_lng:
                     continue
@@ -259,8 +251,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                         best_dist = dist
                         best_node = node
 
-                print(f"MSOA {msoa}: dest=({dest_lat},{dest_lng}), best_node={best_node}, origin={origin_node}, same={best_node==origin_node}")
-
                 if best_node is None or best_node == origin_node:
                     continue
 
@@ -273,15 +263,12 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                     if G.has_edge(u, v):
                         k = min(G[u][v].keys())
                         edge_trips[(u, v, k)] = edge_trips.get((u, v, k), 0) + trips_to_dest
-                        total_assigned += trips_to_dest
 
-                print(f"Assigned {trips_to_dest} trips via path of {len(path)} nodes")
+                total_assigned += trips_to_dest
 
             except Exception as e:
                 print(f"Error routing to {msoa}: {e}")
                 continue
-
-        print(f"Total assigned: {total_assigned}")
 
         nodes, edges = ox.graph_to_gdfs(G)
         edges_reset = edges.reset_index()
@@ -305,7 +292,11 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
 
             features.append({
                 "type": "Feature",
-                "properties": {"name": name, "highway": highway, "length": length, "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False)), "trips": trips},
+                "properties": {
+                    "name": name, "highway": highway, "length": length,
+                    "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False)),
+                    "trips": trips
+                },
                 "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
             })
 
