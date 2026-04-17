@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
+import math
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,6 +18,17 @@ app.add_middleware(
 )
 
 NOMIS_API_KEY = os.getenv("NOMIS_API_KEY")
+
+
+def clean_value(v):
+    if v is None:
+        return None
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    if isinstance(v, list):
+        cleaned = [clean_value(i) for i in v]
+        return cleaned[0] if len(cleaned) == 1 else cleaned
+    return v
 
 
 @app.get("/")
@@ -118,48 +130,193 @@ def get_oa_to_msoa(oa: str):
         data = resp.json()
         if "features" in data and len(data["features"]) > 0:
             attrs = data["features"][0]["attributes"]
-            return {
-                "oa": oa,
-                "msoa": attrs.get("MSOA11CD"),
-                "msoa_name": attrs.get("MSOA11NM")
-            }
+            return {"oa": oa, "msoa": attrs.get("MSOA11CD"), "msoa_name": attrs.get("MSOA11NM")}
         return {"oa": oa, "msoa": None}
     except Exception as e:
         return {"error": str(e)}
-    
+
+
 @app.get("/api/road-network")
 def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
-    """
-    Fetch road network from OSM around the pin location
-    Returns nodes and edges as GeoJSON
-    """
     try:
         import osmnx as ox
-        import json
 
-        # Download road network within radius
-        G = ox.graph_from_point(
-            (pin_lat, pin_lng),
-            dist=radius_m,
-            network_type='drive',
-            simplify=True
-        )
-
-        # Convert to GeoDataFrames
+        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
         nodes, edges = ox.graph_to_gdfs(G)
+        edges_reset = edges.reset_index()
 
-        # Convert edges to GeoJSON
-        edges_geojson = json.loads(edges.reset_index()[['geometry', 'name', 'highway', 'length', 'maxspeed', 'oneway']].to_json())
+        features = []
+        for _, row in edges_reset.iterrows():
+            name = clean_value(row.get('name'))
+            highway = clean_value(row.get('highway'))
+            maxspeed = clean_value(row.get('maxspeed'))
+            length = row.get('length', 0)
+            try:
+                length = float(length)
+                if math.isnan(length):
+                    length = 0
+            except:
+                length = 0
 
-        # Convert nodes to GeoJSON
-        nodes_geojson = json.loads(nodes.reset_index()[['osmid', 'geometry']].to_json())
+            features.append({
+                "type": "Feature",
+                "properties": {"name": name, "highway": highway, "length": length, "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False))},
+                "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
+            })
+
+        node_features = []
+        nodes_reset = nodes.reset_index()
+        for _, row in nodes_reset.iterrows():
+            node_features.append({
+                "type": "Feature",
+                "properties": {"osmid": int(row['osmid'])},
+                "geometry": {"type": "Point", "coordinates": [row['geometry'].x, row['geometry'].y]}
+            })
 
         return {
-            "edges": edges_geojson,
-            "nodes": nodes_geojson,
-            "edge_count": len(edges),
-            "node_count": len(nodes)
+            "edges": {"type": "FeatureCollection", "features": features},
+            "nodes": {"type": "FeatureCollection", "features": node_features},
+            "edge_count": len(features),
+            "node_count": len(node_features)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/assign-trips")
+def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = ""):
+    print(f"assign-trips called: pin=({pin_lat},{pin_lng}) radius={radius_m} vehicle_trips={vehicle_trips} flows='{flows}'")
+
+    try:
+        import osmnx as ox
+        import networkx as nx
+
+        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+        G = ox.add_edge_speeds(G)
+        G = ox.add_edge_travel_times(G)
+
+        origin_node = ox.nearest_nodes(G, pin_lng, pin_lat)
+        print(f"Origin node: {origin_node}, total nodes: {len(G.nodes)}")
+
+        flow_list = []
+        if flows:
+            for item in flows.split(','):
+                parts = item.strip().split(':')
+                if len(parts) == 2:
+                    try:
+                        flow_list.append({'msoa': parts[0].strip(), 'percentage': float(parts[1].strip())})
+                    except:
+                        pass
+
+        print(f"Parsed {len(flow_list)} flows")
+
+        edge_trips = {}
+        for u, v, k in G.edges(keys=True):
+            edge_trips[(u, v, k)] = 0
+
+        total_assigned = 0
+
+        all_paths = nx.single_source_dijkstra_path(G, origin_node, weight='travel_time')
+        print(f"Reachable nodes: {len(all_paths)}")
+
+        for flow in flow_list:
+            msoa = flow['msoa']
+            pct = flow['percentage']
+            trips_to_dest = round(vehicle_trips * pct / 100)
+            if trips_to_dest == 0:
+                continue
+
+            try:
+                centroid_url = (
+                    "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+                    "MSOA_Dec_2011_PWC_in_England_and_Wales_2022/FeatureServer/0/query"
+                    f"?where=msoa11cd='{msoa}'&outFields=msoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
+                )
+                centroid_resp = requests.get(centroid_url, timeout=10)
+                centroid_data = centroid_resp.json()
+
+                if not centroid_data.get('features'):
+                    print(f"No centroid for {msoa}")
+                    continue
+
+                feature = centroid_data['features'][0]
+                geom = feature.get('geometry', {})
+                dest_lng = geom.get('x')
+                dest_lat = geom.get('y')
+                print(f"Centroid for {msoa}: lat={dest_lat}, lng={dest_lng}")
+
+                if not dest_lat or not dest_lng:
+                    continue
+
+                best_node = None
+                best_dist = float('inf')
+                for node in all_paths.keys():
+                    node_data = G.nodes[node]
+                    dx = node_data['x'] - dest_lng
+                    dy = node_data['y'] - dest_lat
+                    dist = dx*dx + dy*dy
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_node = node
+
+                print(f"MSOA {msoa}: dest=({dest_lat},{dest_lng}), best_node={best_node}, origin={origin_node}, same={best_node==origin_node}")
+
+                if best_node is None or best_node == origin_node:
+                    continue
+
+                path = all_paths[best_node]
+                if len(path) < 2:
+                    continue
+
+                for i in range(len(path) - 1):
+                    u, v = path[i], path[i + 1]
+                    if G.has_edge(u, v):
+                        k = min(G[u][v].keys())
+                        edge_trips[(u, v, k)] = edge_trips.get((u, v, k), 0) + trips_to_dest
+                        total_assigned += trips_to_dest
+
+                print(f"Assigned {trips_to_dest} trips via path of {len(path)} nodes")
+
+            except Exception as e:
+                print(f"Error routing to {msoa}: {e}")
+                continue
+
+        print(f"Total assigned: {total_assigned}")
+
+        nodes, edges = ox.graph_to_gdfs(G)
+        edges_reset = edges.reset_index()
+
+        features = []
+        for _, row in edges_reset.iterrows():
+            u = row['u']
+            v = row['v']
+            k = row['key']
+            trips = edge_trips.get((u, v, k), 0)
+            name = clean_value(row.get('name'))
+            highway = clean_value(row.get('highway'))
+            maxspeed = clean_value(row.get('maxspeed'))
+            length = row.get('length', 0)
+            try:
+                length = float(length)
+                if math.isnan(length):
+                    length = 0
+            except:
+                length = 0
+
+            features.append({
+                "type": "Feature",
+                "properties": {"name": name, "highway": highway, "length": length, "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False)), "trips": trips},
+                "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
+            })
+
+        return {
+            "edges": {"type": "FeatureCollection", "features": features},
+            "edge_count": len(features),
+            "node_count": len(G.nodes),
+            "total_assigned": total_assigned,
+            "origin_node": origin_node
         }
 
     except Exception as e:
-        return {"error": str(e)}    
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
