@@ -126,3 +126,40 @@ def get_oa_to_msoa(oa: str):
         return {"oa": oa, "msoa": None}
     except Exception as e:
         return {"error": str(e)}
+    
+@app.get("/api/road-network")
+def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
+    """
+    Fetch road network from OSM around the pin location
+    Returns nodes and edges as GeoJSON
+    """
+    try:
+        import osmnx as ox
+        import json
+
+        # Download road network within radius
+        G = ox.graph_from_point(
+            (pin_lat, pin_lng),
+            dist=radius_m,
+            network_type='drive',
+            simplify=True
+        )
+
+        # Convert to GeoDataFrames
+        nodes, edges = ox.graph_to_gdfs(G)
+
+        # Convert edges to GeoJSON
+        edges_geojson = json.loads(edges.reset_index()[['geometry', 'name', 'highway', 'length', 'maxspeed', 'oneway']].to_json())
+
+        # Convert nodes to GeoJSON
+        nodes_geojson = json.loads(nodes.reset_index()[['osmid', 'geometry']].to_json())
+
+        return {
+            "edges": edges_geojson,
+            "nodes": nodes_geojson,
+            "edge_count": len(edges),
+            "node_count": len(nodes)
+        }
+
+    except Exception as e:
+        return {"error": str(e)}    
