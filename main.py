@@ -75,197 +75,147 @@ def get_od_flows(oa: str):
 
 
 @app.get("/api/od-flows-tiered")
-def get_od_flows_tiered(oa: str, pin_lat: float, pin_lng: float):
-    url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
-    params = {
-        "date": "latest",
-        "currently_residing_in": oa,
-        "place_of_work": "TYPE297",
-        "measures": "20100",
-        "uid": NOMIS_API_KEY,
-        "select": "currently_residing_in_code,place_of_work_code,obs_value",
-    }
+def get_od_flows_tiered(oa: str):
+    """
+    Tiered OD flows:
+    - Same LA as origin OA: LSOA level (TYPE298)
+    - Outside LA: MSOA level (TYPE297), excluding MSOAs within origin LA
+    """
     try:
-        response = requests.get(url, params=params, timeout=30)
-        data = response.json()
-        flows = []
-        if "obs" in data:
-            for item in data["obs"]:
-                dest = item.get("place_of_work", {}).get("geogcode", "")
-                count = item.get("obs_value", {}).get("value", 0)
-                if count and count > 0 and dest.startswith('E02'):
-                    flows.append({"destination": dest, "count": count})
-
-        total = sum(f["count"] for f in flows)
-        for f in flows:
-            f["percentage"] = round((f["count"] / total * 100), 2) if total > 0 else 0
-        flows.sort(key=lambda x: x["count"], reverse=True)
-
-        if not flows:
-            return {"origin_oa": oa, "total_trips": total, "flows": []}
-
-        msoa_codes = [f["destination"] for f in flows[:50]]
-        codes_str = "','".join(msoa_codes)
-
-        centroid_url = (
-            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-            "MSOA_Dec_2011_PWC_in_England_and_Wales_2022/FeatureServer/0/query"
-            f"?where=msoa11cd IN ('{codes_str}')"
-            "&outFields=msoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=100"
-        )
-        centroid_resp = requests.get(centroid_url, timeout=15)
-        centroid_data = centroid_resp.json()
-
-        centroid_map = {}
-        if centroid_data.get('features'):
-            for feat in centroid_data['features']:
-                code = feat['attributes']['msoa11cd']
-                geom = feat.get('geometry', {})
-                if geom.get('x') and geom.get('y'):
-                    centroid_map[code] = {'lat': geom['y'], 'lng': geom['x']}
-
-        la_lookup_url = (
+        # Step 1: Get origin LA from OA lookup
+        lookup_url = (
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
             "FeatureServer/0/query"
-            f"?where=MSOA11CD IN ('{codes_str}')"
-            "&outFields=MSOA11CD,LAD11CD,LAD11NM&f=json&resultRecordCount=200"
+            "?where=" + f"OA11CD='{oa}'" +
+            "&outFields=OA11CD,LSOA11CD,MSOA11CD,LAD11CD,LAD11NM"
+            "&f=json&resultRecordCount=1"
         )
-        la_resp = requests.get(la_lookup_url, timeout=15)
-        la_data = la_resp.json()
+        lookup_resp = requests.get(lookup_url, timeout=15)
+        lookup_data = lookup_resp.json()
 
-        la_map = {}
-        if la_data.get('features'):
-            for feat in la_data['features']:
-                attrs = feat['attributes']
-                msoa = attrs.get('MSOA11CD')
-                la_code = attrs.get('LAD11CD')
-                la_name = attrs.get('LAD11NM')
-                if msoa and la_code:
-                    la_map[msoa] = {'code': la_code, 'name': la_name}
+        if not lookup_data.get("features"):
+            return {"error": "Could not look up origin OA"}
 
-        tiered_flows = []
-        la_aggregated = {}
+        attrs = lookup_data["features"][0]["attributes"]
+        origin_lad = attrs.get("LAD11CD")
+        origin_lad_name = attrs.get("LAD11NM")
+        origin_lsoa = attrs.get("LSOA11CD")
+        origin_msoa = attrs.get("MSOA11CD")
 
-        for f in flows[:50]:
-            msoa = f["destination"]
-            centroid = centroid_map.get(msoa)
-            if not centroid:
+        # Step 2: LSOA-level flows (TYPE298)
+        lsoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
+        lsoa_params = {
+            "date": "latest",
+            "currently_residing_in": oa,
+            "place_of_work": "TYPE298",
+            "measures": "20100",
+            "uid": NOMIS_API_KEY,
+            "select": "place_of_work_code,place_of_work_name,obs_value",
+            "ExcludeMissingValues": "true",
+        }
+        lsoa_resp = requests.get(lsoa_url, params=lsoa_params, timeout=60)
+        lsoa_data = lsoa_resp.json()
+
+        # Step 3: Get all LSOAs in origin LA so we know what's "local"
+        lsoa_in_la_url = (
+            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+            "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
+            "FeatureServer/0/query"
+            f"?where=LAD11CD='{origin_lad}'"
+            "&outFields=LSOA11CD"
+            "&returnDistinctValues=true"
+            "&f=json&resultRecordCount=2000"
+        )
+        lsoa_in_la_resp = requests.get(lsoa_in_la_url, timeout=15)
+        lsoa_in_la_data = lsoa_in_la_resp.json()
+        local_lsoas = set(
+            f["attributes"]["LSOA11CD"]
+            for f in lsoa_in_la_data.get("features", [])
+        )
+
+        # Step 4: MSOA-level flows (TYPE297) for outside LA
+        msoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
+        msoa_params = {
+            "date": "latest",
+            "currently_residing_in": oa,
+            "place_of_work": "TYPE297",
+            "measures": "20100",
+            "uid": NOMIS_API_KEY,
+            "select": "place_of_work_code,place_of_work_name,obs_value",
+            "ExcludeMissingValues": "true",
+        }
+        msoa_resp = requests.get(msoa_url, params=msoa_params, timeout=60)
+        msoa_data = msoa_resp.json()
+
+        # Step 5: Get all MSOAs in origin LA so we can exclude them
+        msoa_in_la_url = (
+            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+            "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
+            "FeatureServer/0/query"
+            f"?where=LAD11CD='{origin_lad}'"
+            "&outFields=MSOA11CD"
+            "&returnDistinctValues=true"
+            "&f=json&resultRecordCount=500"
+        )
+        msoa_in_la_resp = requests.get(msoa_in_la_url, timeout=15)
+        msoa_in_la_data = msoa_in_la_resp.json()
+        local_msoas = set(
+            f["attributes"]["MSOA11CD"]
+            for f in msoa_in_la_data.get("features", [])
+        )
+
+        # Step 6: Build flows list
+        flows = []
+        total_trips = 0
+
+        # Local LSOA flows (within same LA only)
+        for item in lsoa_data.get("obs", []):
+            dest_code = item.get("place_of_work", {}).get("geogcode", "")
+            dest_name = item.get("place_of_work", {}).get("description", "")
+            count = item.get("obs_value", {}).get("value", 0) or 0
+            if count == 0:
                 continue
-
-            dist = haversine_km(pin_lat, pin_lng, centroid['lat'], centroid['lng'])
-
-            if dist <= 10:
-                tier = 'local'
-                # Expand MSOA to individual OAs
-                try:
-                    oa_url = (
-                        "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-                        "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-                        "FeatureServer/0/query"
-                        f"?where=MSOA11CD='{msoa}'"
-                        "&outFields=OA11CD&f=json&resultRecordCount=500"
-                    )
-                    oa_lookup_resp = requests.get(oa_url, timeout=10)
-                    oa_lookup_data = oa_lookup_resp.json()
-                    oa_codes = [feat['attributes']['OA11CD'] for feat in oa_lookup_data.get('features', [])]
-
-                    if oa_codes:
-                        codes_str = "','".join(oa_codes)
-                        oa_centroid_url = (
-                            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-                            "Output_Areas_Dec_2011_PWC_2022/FeatureServer/0/query"
-                            f"?where=OA11CD IN ('{codes_str}')"
-                            "&outFields=OA11CD&outSR=4326&returnGeometry=true&f=json&resultRecordCount=500"
-                        )
-                        oa_centroid_resp = requests.get(oa_centroid_url, timeout=10)
-                        oa_centroid_data = oa_centroid_resp.json()
-                        oa_count = len(oa_centroid_data.get('features', []))
-
-                        for oa_feat in oa_centroid_data.get('features', []):
-                            oa_code = oa_feat['attributes'].get('OA11CD')
-                            geom = oa_feat.get('geometry', {})
-                            if oa_code and geom.get('x') and geom.get('y'):
-                                # Distribute MSOA trips equally across OAs
-                                oa_count_val = round(f['count'] / oa_count, 2) if oa_count > 0 else 0
-                                oa_pct = f['percentage'] / oa_count if oa_count > 0 else 0
-                                tiered_flows.append({
-                                    'destination': oa_code,
-                                    'count': round(oa_count_val),
-                                    'percentage': round(oa_pct, 4),
-                                    'tier': 'local',
-                                    'distance_km': round(dist, 1),
-                                    'routing_lat': geom['y'],
-                                    'routing_lng': geom['x'],
-                                    'display_code': oa_code,
-                                    'display_type': 'OA',
-                                    'parent_msoa': msoa
-                                })
-                    else:
-                        # Fallback to MSOA if no OAs found
-                        tiered_flows.append({
-                            **f,
-                            'tier': tier,
-                            'distance_km': round(dist, 1),
-                            'routing_lat': centroid['lat'],
-                            'routing_lng': centroid['lng'],
-                            'display_code': msoa,
-                            'display_type': 'MSOA'
-                        })
-                except:
-                    tiered_flows.append({
-                        **f,
-                        'tier': tier,
-                        'distance_km': round(dist, 1),
-                        'routing_lat': centroid['lat'],
-                        'routing_lng': centroid['lng'],
-                        'display_code': msoa,
-                        'display_type': 'MSOA'
-                    })
-            elif dist <= 50:
-                tier = 'regional'
-                tiered_flows.append({
-                    **f,
-                    'tier': tier,
-                    'distance_km': round(dist, 1),
-                    'routing_lat': centroid['lat'],
-                    'routing_lng': centroid['lng'],
-                    'display_code': msoa,
-                    'display_type': 'MSOA'
+            if dest_code in local_lsoas:
+                flows.append({
+                    "destination": dest_code,
+                    "name": dest_name,
+                    "count": count,
+                    "type": "lsoa"
                 })
-            else:
-                la = la_map.get(msoa, {})
-                la_code = la.get('code', 'unknown')
-                if la_code not in la_aggregated:
-                    la_aggregated[la_code] = {
-                        'destination': la_code,
-                        'la_name': la.get('name', la_code),
-                        'count': 0,
-                        'percentage': 0,
-                        'tier': 'national',
-                        'distance_km': round(dist, 1),
-                        'routing_lat': centroid['lat'],
-                        'routing_lng': centroid['lng'],
-                        'display_code': la_code,
-                        'display_type': 'LA'
-                    }
-                la_aggregated[la_code]['count'] += f['count']
+                total_trips += count
 
-        for la_flow in la_aggregated.values():
-            la_flow['percentage'] = round(la_flow['count'] / total * 100, 2) if total > 0 else 0
-            tiered_flows.append(la_flow)
+        # External MSOA flows (outside origin LA only)
+        for item in msoa_data.get("obs", []):
+            dest_code = item.get("place_of_work", {}).get("geogcode", "")
+            dest_name = item.get("place_of_work", {}).get("description", "")
+            count = item.get("obs_value", {}).get("value", 0) or 0
+            if count == 0:
+                continue
+            if dest_code not in local_msoas:
+                flows.append({
+                    "destination": dest_code,
+                    "name": dest_name,
+                    "count": count,
+                    "type": "msoa"
+                })
+                total_trips += count
 
-        tiered_flows.sort(key=lambda x: x['count'], reverse=True)
+        # Percentages and sort
+        for f in flows:
+            f["percentage"] = round((f["count"] / total_trips * 100), 2) if total_trips > 0 else 0
+        flows.sort(key=lambda x: x["count"], reverse=True)
 
         return {
             "origin_oa": oa,
-            "total_trips": total,
-            "flows": tiered_flows,
-            "tiers": {
-                "local": len([f for f in tiered_flows if f['tier'] == 'local']),
-                "regional": len([f for f in tiered_flows if f['tier'] == 'regional']),
-                "national": len([f for f in tiered_flows if f['tier'] == 'national'])
-            }
+            "origin_lsoa": origin_lsoa,
+            "origin_msoa": origin_msoa,
+            "origin_lad": origin_lad,
+            "origin_lad_name": origin_lad_name,
+            "total_trips": total_trips,
+            "flows": flows,
+            "lsoa_count": sum(1 for f in flows if f["type"] == "lsoa"),
+            "msoa_count": sum(1 for f in flows if f["type"] == "msoa"),
         }
 
     except Exception as e:
