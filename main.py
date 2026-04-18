@@ -183,55 +183,69 @@ def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
         return {"error": str(e)}
 
 
-@app.get("/api/split-edge")
-def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: float, radius_m: int = 1000):
-    try:
-        import osmnx as ox
-        from shapely.geometry import Point, LineString
-
-        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
-
-        access_point = Point(access_lng, access_lat)
-
-        nearest = ox.nearest_edges(G, access_lng, access_lat)
-        u, v, k = nearest
-
-        edge_data = G[u][v][k]
-        if 'geometry' in edge_data:
-            line = edge_data['geometry']
-        else:
-            u_data = G.nodes[u]
-            v_data = G.nodes[v]
-            line = LineString([(u_data['x'], u_data['y']), (v_data['x'], v_data['y'])])
-
-        nearest_pt = line.interpolate(line.project(access_point))
-        new_lat = nearest_pt.y
-        new_lng = nearest_pt.x
-
-        return {
-            "access_lat": new_lat,
-            "access_lng": new_lng,
-            "snapped": True,
-            "edge": {"u": u, "v": v}
-        }
-
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
-
-
 @app.get("/api/assign-trips")
-def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = ""):
+def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = "", access_lat: float = None, access_lng: float = None):
     try:
         import osmnx as ox
         import networkx as nx
+        from shapely.geometry import Point, LineString
 
         G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
         G = ox.add_edge_speeds(G)
         G = ox.add_edge_travel_times(G)
 
-        origin_node = ox.nearest_nodes(G, pin_lng, pin_lat)
+        # Determine origin node
+        if access_lat and access_lng:
+            # Find nearest edge
+            u, v, k = ox.nearest_edges(G, access_lng, access_lat)
+            edge_data = G[u][v][k]
 
+            # Snap to nearest point on edge
+            if 'geometry' in edge_data:
+                line = edge_data['geometry']
+            else:
+                line = LineString([(G.nodes[u]['x'], G.nodes[u]['y']),
+                                   (G.nodes[v]['x'], G.nodes[v]['y'])])
+
+            snapped = line.interpolate(line.project(Point(access_lng, access_lat)))
+            new_lng, new_lat = snapped.x, snapped.y
+
+            # Add new node
+            new_node_id = 999999999
+            G.add_node(new_node_id, x=new_lng, y=new_lat)
+
+            # Get travel time from edge
+            speed = edge_data.get('speed_kph', 50)
+            if not speed or (isinstance(speed, float) and math.isnan(speed)):
+                speed = 50
+
+            # Distance from new node to u and v
+            def dist_m(lng1, lat1, lng2, lat2):
+                return ((lng2 - lng1) ** 2 + (lat2 - lat1) ** 2) ** 0.5 * 111320
+
+            dist_u = dist_m(new_lng, new_lat, G.nodes[u]['x'], G.nodes[u]['y'])
+            dist_v = dist_m(new_lng, new_lat, G.nodes[v]['x'], G.nodes[v]['y'])
+            tt_u = dist_u / (speed * 1000 / 3600)
+            tt_v = dist_v / (speed * 1000 / 3600)
+
+            # Connect new node to both ends of the split edge
+            G.add_edge(new_node_id, u, 0, travel_time=tt_u, length=dist_u,
+                      geometry=LineString([(new_lng, new_lat), (G.nodes[u]['x'], G.nodes[u]['y'])]))
+            G.add_edge(u, new_node_id, 0, travel_time=tt_u, length=dist_u,
+                      geometry=LineString([(G.nodes[u]['x'], G.nodes[u]['y']), (new_lng, new_lat)]))
+            G.add_edge(new_node_id, v, 0, travel_time=tt_v, length=dist_v,
+                      geometry=LineString([(new_lng, new_lat), (G.nodes[v]['x'], G.nodes[v]['y'])]))
+            G.add_edge(v, new_node_id, 0, travel_time=tt_v, length=dist_v,
+                      geometry=LineString([(G.nodes[v]['x'], G.nodes[v]['y']), (new_lng, new_lat)]))
+
+            origin_node = new_node_id
+            print(f"Access node added at ({new_lat:.5f},{new_lng:.5f}), connected to nodes {u} and {v}")
+
+        else:
+            origin_node = ox.nearest_nodes(G, pin_lng, pin_lat)
+            print(f"Using nearest node to pin: {origin_node}")
+
+        # Parse flows
         flow_list = []
         if flows:
             for item in flows.split(','):
@@ -242,9 +256,10 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                     except:
                         pass
 
+        # Initialise edge trip counts
         edge_trips = {}
-        for u, v, k in G.edges(keys=True):
-            edge_trips[(u, v, k)] = 0
+        for uu, vv, kk in G.edges(keys=True):
+            edge_trips[(uu, vv, kk)] = 0
 
         total_assigned = 0
 
@@ -293,10 +308,10 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                     continue
 
                 for i in range(len(path) - 1):
-                    u, v = path[i], path[i + 1]
-                    if G.has_edge(u, v):
-                        k = min(G[u][v].keys())
-                        edge_trips[(u, v, k)] = edge_trips.get((u, v, k), 0) + trips_to_dest
+                    uu, vv = path[i], path[i + 1]
+                    if G.has_edge(uu, vv):
+                        kk = min(G[uu][vv].keys())
+                        edge_trips[(uu, vv, kk)] = edge_trips.get((uu, vv, kk), 0) + trips_to_dest
 
                 total_assigned += trips_to_dest
 
@@ -304,19 +319,21 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                 print(f"Error routing to {msoa}: {e}")
                 continue
 
-        nodes, edges = ox.graph_to_gdfs(G)
-        edges_reset = edges.reset_index()
-
+        # Build GeoJSON output
         features = []
-        for _, row in edges_reset.iterrows():
-            u = row['u']
-            v = row['v']
-            k = row['key']
-            trips = edge_trips.get((u, v, k), 0)
-            name = clean_value(row.get('name'))
-            highway = clean_value(row.get('highway'))
-            maxspeed = clean_value(row.get('maxspeed'))
-            length = row.get('length', 0)
+        for uu, vv, kk, data in G.edges(keys=True, data=True):
+            trips = edge_trips.get((uu, vv, kk), 0)
+
+            if 'geometry' in data:
+                coords = list(data['geometry'].coords)
+            else:
+                coords = [(G.nodes[uu]['x'], G.nodes[uu]['y']),
+                          (G.nodes[vv]['x'], G.nodes[vv]['y'])]
+
+            name = clean_value(data.get('name'))
+            highway = clean_value(data.get('highway'))
+            maxspeed = clean_value(data.get('maxspeed'))
+            length = data.get('length', 0)
             try:
                 length = float(length)
                 if math.isnan(length):
@@ -328,10 +345,10 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                 "type": "Feature",
                 "properties": {
                     "name": name, "highway": highway, "length": length,
-                    "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False)),
+                    "maxspeed": maxspeed, "oneway": bool(data.get('oneway', False)),
                     "trips": trips
                 },
-                "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
+                "geometry": {"type": "LineString", "coordinates": coords}
             })
 
         return {
