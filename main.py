@@ -183,6 +183,43 @@ def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
         return {"error": str(e)}
 
 
+@app.get("/api/split-edge")
+def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: float, radius_m: int = 1000):
+    try:
+        import osmnx as ox
+        from shapely.geometry import Point, LineString
+
+        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+
+        access_point = Point(access_lng, access_lat)
+
+        nearest = ox.nearest_edges(G, access_lng, access_lat)
+        u, v, k = nearest
+
+        edge_data = G[u][v][k]
+        if 'geometry' in edge_data:
+            line = edge_data['geometry']
+        else:
+            u_data = G.nodes[u]
+            v_data = G.nodes[v]
+            line = LineString([(u_data['x'], u_data['y']), (v_data['x'], v_data['y'])])
+
+        nearest_pt = line.interpolate(line.project(access_point))
+        new_lat = nearest_pt.y
+        new_lng = nearest_pt.x
+
+        return {
+            "access_lat": new_lat,
+            "access_lng": new_lng,
+            "snapped": True,
+            "edge": {"u": u, "v": v}
+        }
+
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 @app.get("/api/assign-trips")
 def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = ""):
     try:
@@ -211,8 +248,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
 
         total_assigned = 0
 
-        all_paths = nx.single_source_dijkstra_path(G, origin_node, weight='travel_time')
-
         for flow in flow_list:
             msoa = flow['msoa']
             pct = flow['percentage']
@@ -240,21 +275,20 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                 if not dest_lat or not dest_lng:
                     continue
 
-                best_node = None
-                best_dist = float('inf')
-                for node in all_paths.keys():
-                    node_data = G.nodes[node]
-                    dx = node_data['x'] - dest_lng
-                    dy = node_data['y'] - dest_lat
-                    dist = dx*dx + dy*dy
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_node = node
+                dest_node = ox.nearest_nodes(G, dest_lng, dest_lat)
 
-                if best_node is None or best_node == origin_node:
+                if dest_node == origin_node:
                     continue
 
-                path = all_paths[best_node]
+                try:
+                    path = nx.shortest_path(G, origin_node, dest_node, weight='travel_time')
+                except nx.NetworkXNoPath:
+                    try:
+                        G_undirected = G.to_undirected()
+                        path = nx.shortest_path(G_undirected, origin_node, dest_node, weight='travel_time')
+                    except:
+                        continue
+
                 if len(path) < 2:
                     continue
 
