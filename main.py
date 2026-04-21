@@ -18,6 +18,7 @@ app.add_middleware(
 )
 
 NOMIS_API_KEY = os.getenv("NOMIS_API_KEY")
+HERE_API_KEY = os.getenv("HERE_API_KEY")
 
 
 def clean_value(v):
@@ -37,6 +38,136 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
+
+
+def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
+    """
+    Call HERE Routing API v8 and return a list of (lat, lng) coordinates.
+    departure_time_str: e.g. "08:00" — will be set to next Monday at that time
+    for consistent historical traffic data.
+    """
+    try:
+        from datetime import datetime, timedelta
+        # Find next Monday for consistent weekday traffic data
+        today = datetime.utcnow()
+        days_ahead = 0 - today.weekday()  # Monday is 0
+        if days_ahead <= 0:
+            days_ahead += 7
+        next_monday = today + timedelta(days=days_ahead)
+        hour, minute = map(int, departure_time_str.split(':'))
+        departure_dt = next_monday.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        departure_iso = departure_dt.strftime('%Y-%m-%dT%H:%M:%S')
+
+        url = "https://router.hereapi.com/v8/routes"
+        params = {
+            "apikey": HERE_API_KEY,
+            "transportMode": "car",
+            "origin": f"{origin_lat},{origin_lng}",
+            "destination": f"{dest_lat},{dest_lng}",
+            "return": "polyline",
+            "departureTime": departure_iso,
+            "routingMode": "fast",
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+
+        if "routes" not in data or not data["routes"]:
+            print(f"HERE no route: {data.get('title', 'unknown error')}")
+            return None
+
+        # Decode the flexible polyline
+        section = data["routes"][0]["sections"][0]
+        encoded = section["polyline"]
+        coords = decode_here_polyline(encoded)
+        return coords
+
+    except Exception as e:
+        print(f"HERE routing error: {e}")
+        return None
+
+
+def decode_here_polyline(encoded):
+    """
+    Decode HERE flexible polyline encoding to list of (lat, lng) tuples.
+    https://github.com/heremaps/flexible-polyline
+    """
+    DECODING_TABLE = [
+        62, -1, -1, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1, -1,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+        22, 23, 24, 25, -1, -1, -1, -1, 63, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+        36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51
+    ]
+
+    def decode_unsigned(encoded, i):
+        result = 0
+        shift = 0
+        while True:
+            c = DECODING_TABLE[ord(encoded[i]) - 45]
+            i += 1
+            result |= (c & 0x1F) << shift
+            shift += 5
+            if c < 0x20:
+                break
+        return result, i
+
+    def decode_signed(encoded, i):
+        unsigned, i = decode_unsigned(encoded, i)
+        if unsigned & 1:
+            result = ~(unsigned >> 1)
+        else:
+            result = unsigned >> 1
+        return result, i
+
+    i = 0
+    # Read header
+    _, i = decode_unsigned(encoded, i)  # version
+    header_content, i = decode_unsigned(encoded, i)
+    precision = header_content & 0xF
+    third_dim = (header_content >> 4) & 0x7
+
+    factor = 10 ** precision
+    coords = []
+    lat, lng = 0, 0
+
+    while i < len(encoded):
+        dlat, i = decode_signed(encoded, i)
+        dlng, i = decode_signed(encoded, i)
+        if third_dim:
+            _, i = decode_signed(encoded, i)
+        lat += dlat
+        lng += dlng
+        coords.append((lat / factor, lng / factor))
+
+    return coords
+
+
+def match_polyline_to_edges(coords, G_route, edge_trips_route, trips_to_dest):
+    """
+    Given a list of (lat, lng) coords from HERE, snap each segment to the
+    nearest OSM edge in G_route and accumulate trip counts.
+    """
+    if not coords or len(coords) < 2:
+        return 0
+
+    assigned = 0
+    # Sample every Nth point to avoid too many nearest-edge lookups
+    step = max(1, len(coords) // 30)
+    sampled = coords[::step]
+    if coords[-1] not in sampled:
+        sampled.append(coords[-1])
+
+    prev_edge = None
+    for lat, lng in sampled:
+        try:
+            u, v, k = ox.nearest_edges(G_route, lng, lat)
+            edge_key = (u, v, k)
+            if edge_key != prev_edge:
+                edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
+                assigned += trips_to_dest
+                prev_edge = edge_key
+        except Exception:
+            continue
+    return trips_to_dest  # return original trips not multiplied
 
 
 @app.get("/")
@@ -346,11 +477,18 @@ def get_oa_to_msoa(oa: str):
 
 
 @app.get("/api/road-network")
-def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
+def get_road_network(pin_lat: float, pin_lng: float, polygon: str = None, radius_m: int = 1000):
     try:
         import osmnx as ox
+        from shapely.geometry import Polygon as ShapelyPolygon
+        import json
 
-        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+        if polygon:
+            coords = json.loads(polygon)
+            shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
+            G = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+        else:
+            G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
         nodes, edges = ox.graph_to_gdfs(G)
         edges_reset = edges.reset_index()
 
@@ -393,12 +531,18 @@ def get_road_network(pin_lat: float, pin_lng: float, radius_m: int = 1000):
 
 
 @app.get("/api/split-edge")
-def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: float, radius_m: int = 1000):
+def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: float, polygon: str = None, radius_m: int = 1000):
     try:
         import osmnx as ox
-        from shapely.geometry import Point, LineString
+        from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
+        import json
 
-        G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+        if polygon:
+            coords = json.loads(polygon)
+            shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
+            G = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+        else:
+            G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
         access_point = Point(access_lng, access_lat)
         nearest = ox.nearest_edges(G, access_lng, access_lat)
         u, v, k = nearest
@@ -418,20 +562,28 @@ def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: fl
 
 
 @app.get("/api/assign-trips")
-def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_trips: int = 0, flows: str = "", access_lat: float = None, access_lng: float = None):
+def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: str = None, vehicle_trips: int = 0, flows: str = "", access_lat: float = None, access_lng: float = None, am_peak: str = "08:00", pm_peak: str = "17:00", assign_period: str = "am"):
     try:
         import osmnx as ox
         import networkx as nx
-        from shapely.geometry import Point, LineString
+        from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
+        import json
 
-        routing_radius = max(radius_m * 4, 15000)
-        print(f"Loading routing network ({routing_radius}m) and display network ({radius_m}m)")
+        if polygon:
+            coords = json.loads(polygon)
+            shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
+            G_display = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+            print(f"Display network loaded from polygon ({len(G_display.nodes)} nodes)")
+        else:
+            G_display = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+            print(f"Display network loaded from radius {radius_m}m")
 
+        # G_route is used for NetworkX fallback only — keep it small
+        routing_radius = min(radius_m * 2 if not polygon else 2000, 3000)
         G_route = ox.graph_from_point((pin_lat, pin_lng), dist=routing_radius, network_type='drive', simplify=True)
         G_route = ox.add_edge_speeds(G_route)
         G_route = ox.add_edge_travel_times(G_route)
-
-        G_display = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+        print(f"Routing network loaded ({routing_radius}m fallback)")
 
         if access_lat and access_lng:
             u, v, k = ox.nearest_edges(G_route, access_lng, access_lat)
@@ -506,6 +658,14 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
 
         total_assigned = 0
 
+        # Determine origin coordinates
+        if access_lat and access_lng:
+            origin_lat_coord = access_lat
+            origin_lng_coord = access_lng
+        else:
+            origin_lat_coord = pin_lat
+            origin_lng_coord = pin_lng
+
         for flow in flow_list:
             msoa = flow['msoa']
             pct = flow['percentage']
@@ -534,11 +694,20 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                     if not dest_lat or not dest_lng:
                         continue
 
-                dest_node = ox.nearest_nodes(G_route, dest_lng, dest_lat)
+                # Use HERE routing if API key available, else fall back to NetworkX
+                if HERE_API_KEY:
+                    departure_time = am_peak if assign_period != 'pm' else pm_peak
+                    coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
+                    if coords:
+                        match_polyline_to_edges(coords, G_route, edge_trips_route, trips_to_dest)
+                        total_assigned += trips_to_dest
+                        print(f"HERE routed {trips_to_dest} trips to {msoa} via {len(coords)} coords")
+                        continue
 
+                # NetworkX fallback
+                dest_node = ox.nearest_nodes(G_route, dest_lng, dest_lat)
                 if dest_node == origin_node:
                     continue
-
                 try:
                     path = nx.shortest_path(G_route, origin_node, dest_node, weight='travel_time')
                 except nx.NetworkXNoPath:
@@ -547,18 +716,15 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, vehicle_t
                         path = nx.shortest_path(G_undirected, origin_node, dest_node, weight='travel_time')
                     except:
                         continue
-
                 if len(path) < 2:
                     continue
-
                 for i in range(len(path) - 1):
                     uu, vv = path[i], path[i + 1]
                     if G_route.has_edge(uu, vv):
                         kk = min(G_route[uu][vv].keys())
                         edge_trips_route[(uu, vv, kk)] = edge_trips_route.get((uu, vv, kk), 0) + trips_to_dest
-
                 total_assigned += trips_to_dest
-                print(f"Routed {trips_to_dest} trips to {msoa} via {len(path)} nodes")
+                print(f"NetworkX routed {trips_to_dest} trips to {msoa} via {len(path)} nodes")
 
             except Exception as e:
                 print(f"Error routing to {msoa}: {e}")
