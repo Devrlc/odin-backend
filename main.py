@@ -72,7 +72,7 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
         data = resp.json()
 
         if "routes" not in data or not data["routes"]:
-            print(f"HERE no route: {data.get('title', 'unknown error')}")
+            print(f"HERE no route response: {data}")
             return None
 
         # Decode the flexible polyline
@@ -572,7 +572,8 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
         if polygon:
             coords = json.loads(polygon)
             shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
-            G_display = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+            shapely_poly_buffered = shapely_poly.buffer(0.002)
+            G_display = ox.graph_from_polygon(shapely_poly_buffered, network_type='drive', simplify=True)
             print(f"Display network loaded from polygon ({len(G_display.nodes)} nodes)")
         else:
             G_display = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
@@ -653,7 +654,7 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                         pass
 
         edge_trips_route = {}
-        for uu, vv, kk in G_route.edges(keys=True):
+        for uu, vv, kk in G_display.edges(keys=True):
             edge_trips_route[(uu, vv, kk)] = 0
 
         total_assigned = 0
@@ -699,7 +700,7 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                     departure_time = am_peak if assign_period != 'pm' else pm_peak
                     coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
                     if coords:
-                        match_polyline_to_edges(coords, G_route, edge_trips_route, trips_to_dest)
+                        match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest)
                         total_assigned += trips_to_dest
                         print(f"HERE routed {trips_to_dest} trips to {msoa} via {len(coords)} coords")
                         continue
@@ -759,13 +760,7 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
             except:
                 u_x = u_y = v_x = v_y = None
 
-            trips = 0
-            if u_x and v_x:
-                u_route = ox.nearest_nodes(G_route, u_x, u_y)
-                v_route = ox.nearest_nodes(G_route, v_x, v_y)
-                if G_route.has_edge(u_route, v_route):
-                    kk = min(G_route[u_route][v_route].keys())
-                    trips = edge_trips_route.get((u_route, v_route, kk), 0)
+            trips = edge_trips_route.get((u_disp, v_disp, 0), 0)
 
             features.append({
                 "type": "Feature",
