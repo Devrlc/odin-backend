@@ -146,18 +146,22 @@ def match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest, 
     if not coords or len(coords) < 2:
         return
 
-    step = max(1, len(coords) // 50)
+    step = max(1, len(coords) // 100)
     sampled = coords[::step]
     if coords[-1] not in sampled:
         sampled.append(coords[-1])
 
     if polygon_boundary:
         from shapely.geometry import Point as ShapelyPoint
+        # Use a larger buffer for filtering — only exclude points well outside the study area
+        filter_boundary = polygon_boundary.buffer(0.005)
         sampled = [(lat, lng) for lat, lng in sampled
-                   if polygon_boundary.contains(ShapelyPoint(lng, lat))]
+                   if filter_boundary.contains(ShapelyPoint(lng, lat))]
 
     if not sampled:
-        return
+        # If nothing in polygon, use all coords — route must pass through
+        step = max(1, len(coords) // 20)
+        sampled = coords[::step]
 
     hit_edges = set()
     for lat, lng in sampled:
@@ -685,6 +689,8 @@ def assign_trips(
             pct = flow['percentage']
             trips_to_dest = round(vehicle_trips * pct / 100)
             if trips_to_dest == 0:
+                trips_to_dest = 1  # assign at least 1 trip to any destination with a percentage
+            if pct == 0:
                 continue
 
             try:
