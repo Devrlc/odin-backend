@@ -141,33 +141,32 @@ def decode_here_polyline(encoded):
     return coords
 
 
-def match_polyline_to_edges(coords, G_route, edge_trips_route, trips_to_dest):
+def match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest):
     """
-    Given a list of (lat, lng) coords from HERE, snap each segment to the
-    nearest OSM edge in G_route and accumulate trip counts.
+    Given a list of (lat, lng) coords from HERE, find which edges in G_display
+    the route passes through and assign trip counts once per unique edge.
     """
     if not coords or len(coords) < 2:
-        return 0
+        return
 
-    assigned = 0
-    # Sample every Nth point to avoid too many nearest-edge lookups
-    step = max(1, len(coords) // 30)
+    # Sample points along the polyline
+    step = max(1, len(coords) // 50)
     sampled = coords[::step]
     if coords[-1] not in sampled:
         sampled.append(coords[-1])
 
-    prev_edge = None
+    # Collect unique edges hit by this route
+    hit_edges = set()
     for lat, lng in sampled:
         try:
-            u, v, k = ox.nearest_edges(G_route, lng, lat)
-            edge_key = (u, v, k)
-            if edge_key != prev_edge:
-                edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
-                assigned += trips_to_dest
-                prev_edge = edge_key
+            u, v, k = ox.nearest_edges(G_display, lng, lat)
+            hit_edges.add((u, v, k))
         except Exception:
             continue
-    return trips_to_dest  # return original trips not multiplied
+
+    # Add trips_to_dest once per unique edge
+    for edge_key in hit_edges:
+        edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
 
 
 @app.get("/")
