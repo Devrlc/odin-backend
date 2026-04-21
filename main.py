@@ -48,7 +48,6 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
     """
     try:
         from datetime import datetime, timedelta
-        # Find next Monday for consistent weekday traffic data
         today = datetime.utcnow()
         days_ahead = 0 - today.weekday()  # Monday is 0
         if days_ahead <= 0:
@@ -75,7 +74,6 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
             print(f"HERE no route response: {data}")
             return None
 
-        # Decode the flexible polyline
         section = data["routes"][0]["sections"][0]
         encoded = section["polyline"]
         coords = decode_here_polyline(encoded)
@@ -89,7 +87,6 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
 def decode_here_polyline(encoded):
     """
     Decode HERE flexible polyline encoding to list of (lat, lng) tuples.
-    https://github.com/heremaps/flexible-polyline
     """
     DECODING_TABLE = [
         62, -1, -1, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1, -1,
@@ -119,7 +116,6 @@ def decode_here_polyline(encoded):
         return result, i
 
     i = 0
-    # Read header
     _, i = decode_unsigned(encoded, i)  # version
     header_content, i = decode_unsigned(encoded, i)
     precision = header_content & 0xF
@@ -141,30 +137,37 @@ def decode_here_polyline(encoded):
     return coords
 
 
-def match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest):
+def match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest, polygon_boundary=None):
     """
     Given a list of (lat, lng) coords from HERE, find which edges in G_display
     the route passes through and assign trip counts once per unique edge.
+    Only snaps coords that fall within the polygon boundary.
     """
     if not coords or len(coords) < 2:
         return
 
-    # Sample points along the polyline
     step = max(1, len(coords) // 50)
     sampled = coords[::step]
     if coords[-1] not in sampled:
         sampled.append(coords[-1])
 
-    # Collect unique edges hit by this route
+    if polygon_boundary:
+        from shapely.geometry import Point as ShapelyPoint
+        sampled = [(lat, lng) for lat, lng in sampled
+                   if polygon_boundary.contains(ShapelyPoint(lng, lat))]
+
+    if not sampled:
+        return
+
     hit_edges = set()
     for lat, lng in sampled:
         try:
+            import osmnx as ox
             u, v, k = ox.nearest_edges(G_display, lng, lat)
             hit_edges.add((u, v, k))
         except Exception:
             continue
 
-    # Add trips_to_dest once per unique edge
     for edge_key in hit_edges:
         edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
 
@@ -212,7 +215,6 @@ def get_od_flows_tiered(oa: str):
     - Outside LA: MSOA level (TYPE297), excluding MSOAs within origin LA
     """
     try:
-        # Step 1: Get origin LA from OA lookup
         lookup_url = (
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
@@ -233,7 +235,6 @@ def get_od_flows_tiered(oa: str):
         origin_lsoa = attrs.get("LSOA11CD")
         origin_msoa = attrs.get("MSOA11CD")
 
-        # Step 2: LSOA-level flows (TYPE298)
         lsoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
         lsoa_params = {
             "date": "latest",
@@ -247,7 +248,6 @@ def get_od_flows_tiered(oa: str):
         lsoa_resp = requests.get(lsoa_url, params=lsoa_params, timeout=60)
         lsoa_data = lsoa_resp.json()
 
-        # Step 3: Get all LSOAs in origin LA so we know what's "local"
         lsoa_in_la_url = (
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
@@ -264,7 +264,6 @@ def get_od_flows_tiered(oa: str):
             for f in lsoa_in_la_data.get("features", [])
         )
 
-        # Step 4: MSOA-level flows (TYPE297) for outside LA
         msoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
         msoa_params = {
             "date": "latest",
@@ -278,7 +277,6 @@ def get_od_flows_tiered(oa: str):
         msoa_resp = requests.get(msoa_url, params=msoa_params, timeout=60)
         msoa_data = msoa_resp.json()
 
-        # Step 5: Get all MSOAs in origin LA so we can exclude them
         msoa_in_la_url = (
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
@@ -295,11 +293,9 @@ def get_od_flows_tiered(oa: str):
             for f in msoa_in_la_data.get("features", [])
         )
 
-        # Step 6: Build flows list
         flows = []
         total_trips = 0
 
-        # Local LSOA flows (within same LA only)
         for item in lsoa_data.get("obs", []):
             dest_code = item.get("place_of_work", {}).get("geogcode", "")
             dest_name = item.get("place_of_work", {}).get("description", "")
@@ -315,7 +311,6 @@ def get_od_flows_tiered(oa: str):
                 })
                 total_trips += count
 
-        # External MSOA flows (outside origin LA only)
         for item in msoa_data.get("obs", []):
             dest_code = item.get("place_of_work", {}).get("geogcode", "")
             dest_name = item.get("place_of_work", {}).get("description", "")
@@ -331,7 +326,6 @@ def get_od_flows_tiered(oa: str):
                 })
                 total_trips += count
 
-        # Percentages and sort
         for f in flows:
             f["percentage"] = round((f["count"] / total_trips * 100), 2) if total_trips > 0 else 0
         flows.sort(key=lambda x: x["count"], reverse=True)
@@ -485,9 +479,11 @@ def get_road_network(pin_lat: float, pin_lng: float, polygon: str = None, radius
         if polygon:
             coords = json.loads(polygon)
             shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
-            G = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+            shapely_poly_buffered = shapely_poly.buffer(0.002)
+            G = ox.graph_from_polygon(shapely_poly_buffered, network_type='drive', simplify=True)
         else:
             G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+
         nodes, edges = ox.graph_to_gdfs(G)
         edges_reset = edges.reset_index()
 
@@ -539,9 +535,11 @@ def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: fl
         if polygon:
             coords = json.loads(polygon)
             shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
-            G = ox.graph_from_polygon(shapely_poly, network_type='drive', simplify=True)
+            shapely_poly_buffered = shapely_poly.buffer(0.002)
+            G = ox.graph_from_polygon(shapely_poly_buffered, network_type='drive', simplify=True)
         else:
             G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
+
         access_point = Point(access_lng, access_lat)
         nearest = ox.nearest_edges(G, access_lng, access_lat)
         u, v, k = nearest
@@ -561,13 +559,26 @@ def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: fl
 
 
 @app.get("/api/assign-trips")
-def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: str = None, vehicle_trips: int = 0, flows: str = "", access_lat: float = None, access_lng: float = None, am_peak: str = "08:00", pm_peak: str = "17:00", assign_period: str = "am"):
+def assign_trips(
+    pin_lat: float, pin_lng: float,
+    radius_m: int = 1000,
+    polygon: str = None,
+    vehicle_trips: int = 0,
+    flows: str = "",
+    access_lat: float = None,
+    access_lng: float = None,
+    am_peak: str = "08:00",
+    pm_peak: str = "17:00",
+    assign_period: str = "am"
+):
     try:
         import osmnx as ox
         import networkx as nx
         from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
         import json
 
+        # Build display network from polygon or radius
+        shapely_poly_buffered = None
         if polygon:
             coords = json.loads(polygon)
             shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
@@ -585,6 +596,7 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
         G_route = ox.add_edge_travel_times(G_route)
         print(f"Routing network loaded ({routing_radius}m fallback)")
 
+        # Set up origin node for NetworkX fallback
         if access_lat and access_lng:
             u, v, k = ox.nearest_edges(G_route, access_lng, access_lat)
             edge_data = G_route[u][v][k]
@@ -627,6 +639,15 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
             origin_node = ox.nearest_nodes(G_route, pin_lng, pin_lat)
             print(f"Using nearest node: {origin_node}")
 
+        # Determine origin coordinates for HERE routing
+        if access_lat and access_lng:
+            origin_lat_coord = access_lat
+            origin_lng_coord = access_lng
+        else:
+            origin_lat_coord = pin_lat
+            origin_lng_coord = pin_lng
+
+        # Parse flows string
         flow_list = []
         if flows:
             for item in flows.split(','):
@@ -652,19 +673,12 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                     except:
                         pass
 
+        # Initialise edge trip counts from G_display
         edge_trips_route = {}
         for uu, vv, kk in G_display.edges(keys=True):
             edge_trips_route[(uu, vv, kk)] = 0
 
         total_assigned = 0
-
-        # Determine origin coordinates
-        if access_lat and access_lng:
-            origin_lat_coord = access_lat
-            origin_lng_coord = access_lng
-        else:
-            origin_lat_coord = pin_lat
-            origin_lng_coord = pin_lng
 
         for flow in flow_list:
             msoa = flow['msoa']
@@ -677,15 +691,26 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                 dest_lat = flow.get('dest_lat')
                 dest_lng = flow.get('dest_lng')
 
+                # Look up centroid if not provided
                 if not dest_lat or not dest_lng:
-                    centroid_url = (
-                        "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-                        "MSOA_Dec_2011_PWC_in_England_and_Wales_2022/FeatureServer/0/query"
-                        f"?where=msoa11cd='{msoa}'&outFields=msoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
-                    )
+                    zone_code = msoa
+                    if zone_code.startswith('E02') or zone_code.startswith('W02'):
+                        centroid_url = (
+                            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+                            "MSOA_Dec_2011_PWC_in_England_and_Wales_2022/FeatureServer/0/query"
+                            f"?where=msoa11cd='{zone_code}'&outFields=msoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
+                        )
+                    else:
+                        # LSOA centroid lookup
+                        centroid_url = (
+                            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+                            "LSOA_Dec_2011_PWC_in_England_and_Wales/FeatureServer/0/query"
+                            f"?where=lsoa11cd='{zone_code}'&outFields=lsoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
+                        )
                     centroid_resp = requests.get(centroid_url, timeout=10)
                     centroid_data = centroid_resp.json()
                     if not centroid_data.get('features'):
+                        print(f"No centroid found for {zone_code}")
                         continue
                     feature = centroid_data['features'][0]
                     geom = feature.get('geometry', {})
@@ -697,11 +722,11 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                 # Use HERE routing if API key available, else fall back to NetworkX
                 if HERE_API_KEY:
                     departure_time = am_peak if assign_period != 'pm' else pm_peak
-                    coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
-                    if coords:
-                        match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest)
+                    here_coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
+                    if here_coords:
+                        match_polyline_to_edges(here_coords, G_display, edge_trips_route, trips_to_dest, shapely_poly_buffered)
                         total_assigned += trips_to_dest
-                        print(f"HERE routed {trips_to_dest} trips to {msoa} via {len(coords)} coords")
+                        print(f"HERE routed {trips_to_dest} trips to {msoa} via {len(here_coords)} coords")
                         continue
 
                 # NetworkX fallback
@@ -718,11 +743,24 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
                         continue
                 if len(path) < 2:
                     continue
+
+                # Match NetworkX path to G_display edges
                 for i in range(len(path) - 1):
-                    uu, vv = path[i], path[i + 1]
-                    if G_route.has_edge(uu, vv):
-                        kk = min(G_route[uu][vv].keys())
-                        edge_trips_route[(uu, vv, kk)] = edge_trips_route.get((uu, vv, kk), 0) + trips_to_dest
+                    node_a, node_b = path[i], path[i + 1]
+                    # Find nearest display edge to midpoint of this path segment
+                    try:
+                        ax = G_route.nodes[node_a]['x']
+                        ay = G_route.nodes[node_a]['y']
+                        bx = G_route.nodes[node_b]['x']
+                        by = G_route.nodes[node_b]['y']
+                        mid_x = (ax + bx) / 2
+                        mid_y = (ay + by) / 2
+                        du, dv, dk = ox.nearest_edges(G_display, mid_x, mid_y)
+                        edge_key = (du, dv, dk)
+                        edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
+                    except Exception:
+                        continue
+
                 total_assigned += trips_to_dest
                 print(f"NetworkX routed {trips_to_dest} trips to {msoa} via {len(path)} nodes")
 
@@ -732,6 +770,7 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
 
         print(f"Total assigned: {total_assigned}")
 
+        # Build output features from G_display with trip counts
         nodes_display, edges_display = ox.graph_to_gdfs(G_display)
         edges_reset = edges_display.reset_index()
 
@@ -750,15 +789,6 @@ def assign_trips(pin_lat: float, pin_lng: float, radius_m: int = 1000, polygon: 
 
             u_disp = row['u']
             v_disp = row['v']
-
-            try:
-                u_x = nodes_display.loc[u_disp, 'x'] if u_disp in nodes_display.index else None
-                u_y = nodes_display.loc[u_disp, 'y'] if u_disp in nodes_display.index else None
-                v_x = nodes_display.loc[v_disp, 'x'] if v_disp in nodes_display.index else None
-                v_y = nodes_display.loc[v_disp, 'y'] if v_disp in nodes_display.index else None
-            except:
-                u_x = u_y = v_x = v_y = None
-
             trips = edge_trips_route.get((u_disp, v_disp, 0), 0)
 
             features.append({
