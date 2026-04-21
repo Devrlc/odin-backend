@@ -41,15 +41,11 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
-    """
-    Call HERE Routing API v8 and return a list of (lat, lng) coordinates.
-    departure_time_str: e.g. "08:00" — will be set to next Monday at that time
-    for consistent historical traffic data.
-    """
+    """Call HERE Routing API v8 and return a list of (lat, lng) coordinates."""
     try:
         from datetime import datetime, timedelta
         today = datetime.utcnow()
-        days_ahead = 0 - today.weekday()  # Monday is 0
+        days_ahead = 0 - today.weekday()
         if days_ahead <= 0:
             days_ahead += 7
         next_monday = today + timedelta(days=days_ahead)
@@ -57,7 +53,6 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
         departure_dt = next_monday.replace(hour=hour, minute=minute, second=0, microsecond=0)
         departure_iso = departure_dt.strftime('%Y-%m-%dT%H:%M:%S')
 
-        url = "https://router.hereapi.com/v8/routes"
         params = {
             "apikey": HERE_API_KEY,
             "transportMode": "car",
@@ -67,17 +62,15 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
             "departureTime": departure_iso,
             "routingMode": "fast",
         }
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get("https://router.hereapi.com/v8/routes", params=params, timeout=15)
         data = resp.json()
 
         if "routes" not in data or not data["routes"]:
             print(f"HERE no route response: {data}")
             return None
 
-        section = data["routes"][0]["sections"][0]
-        encoded = section["polyline"]
-        coords = decode_here_polyline(encoded)
-        return coords
+        encoded = data["routes"][0]["sections"][0]["polyline"]
+        return decode_here_polyline(encoded)
 
     except Exception as e:
         print(f"HERE routing error: {e}")
@@ -85,9 +78,7 @@ def here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time_str):
 
 
 def decode_here_polyline(encoded):
-    """
-    Decode HERE flexible polyline encoding to list of (lat, lng) tuples.
-    """
+    """Decode HERE flexible polyline encoding to list of (lat, lng) tuples."""
     DECODING_TABLE = [
         62, -1, -1, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1, -1,
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
@@ -96,8 +87,7 @@ def decode_here_polyline(encoded):
     ]
 
     def decode_unsigned(encoded, i):
-        result = 0
-        shift = 0
+        result, shift = 0, 0
         while True:
             c = DECODING_TABLE[ord(encoded[i]) - 45]
             i += 1
@@ -109,21 +99,16 @@ def decode_here_polyline(encoded):
 
     def decode_signed(encoded, i):
         unsigned, i = decode_unsigned(encoded, i)
-        if unsigned & 1:
-            result = ~(unsigned >> 1)
-        else:
-            result = unsigned >> 1
+        result = ~(unsigned >> 1) if unsigned & 1 else unsigned >> 1
         return result, i
 
     i = 0
-    _, i = decode_unsigned(encoded, i)  # version
+    _, i = decode_unsigned(encoded, i)
     header_content, i = decode_unsigned(encoded, i)
     precision = header_content & 0xF
     third_dim = (header_content >> 4) & 0x7
-
     factor = 10 ** precision
-    coords = []
-    lat, lng = 0, 0
+    coords, lat, lng = [], 0, 0
 
     while i < len(encoded):
         dlat, i = decode_signed(encoded, i)
@@ -137,43 +122,14 @@ def decode_here_polyline(encoded):
     return coords
 
 
-def match_polyline_to_edges(coords, G_display, edge_trips_route, trips_to_dest, polygon_boundary=None):
-    """
-    Given a list of (lat, lng) coords from HERE, find which edges in G_display
-    the route passes through and assign trip counts once per unique edge.
-    Only snaps coords that fall within the polygon boundary.
-    """
-    if not coords or len(coords) < 2:
-        return
-
-    step = max(1, len(coords) // 100)
-    sampled = coords[::step]
-    if coords[-1] not in sampled:
-        sampled.append(coords[-1])
-
-    if polygon_boundary:
-        from shapely.geometry import Point as ShapelyPoint
-        # Use a larger buffer for filtering — only exclude points well outside the study area
-        filter_boundary = polygon_boundary.buffer(0.005)
-        sampled = [(lat, lng) for lat, lng in sampled
-                   if filter_boundary.contains(ShapelyPoint(lng, lat))]
-
-    if not sampled:
-        # If nothing in polygon, use all coords — route must pass through
-        step = max(1, len(coords) // 20)
-        sampled = coords[::step]
-
-    hit_edges = set()
-    for lat, lng in sampled:
-        try:
-            import osmnx as ox
-            u, v, k = ox.nearest_edges(G_display, lng, lat)
-            hit_edges.add((u, v, k))
-        except Exception:
-            continue
-
-    for edge_key in hit_edges:
-        edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
+def clip_polyline_to_polygon(coords, polygon_boundary):
+    """Clip (lat, lng) coords to those within the polygon boundary (with buffer)."""
+    if not polygon_boundary or not coords:
+        return coords
+    from shapely.geometry import Point as ShapelyPoint
+    filter_poly = polygon_boundary.buffer(0.003)
+    clipped = [(lat, lng) for lat, lng in coords if filter_poly.contains(ShapelyPoint(lng, lat))]
+    return clipped if len(clipped) >= 2 else coords[:2]
 
 
 @app.get("/")
@@ -185,16 +141,12 @@ def root():
 def get_od_flows(oa: str):
     url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
     params = {
-        "date": "latest",
-        "currently_residing_in": oa,
-        "place_of_work": "TYPE297",
-        "measures": "20100",
-        "uid": NOMIS_API_KEY,
+        "date": "latest", "currently_residing_in": oa, "place_of_work": "TYPE297",
+        "measures": "20100", "uid": NOMIS_API_KEY,
         "select": "currently_residing_in_code,place_of_work_code,obs_value",
     }
     try:
-        response = requests.get(url, params=params, timeout=30)
-        data = response.json()
+        data = requests.get(url, params=params, timeout=30).json()
         flows = []
         if "obs" in data:
             for item in data["obs"]:
@@ -213,22 +165,13 @@ def get_od_flows(oa: str):
 
 @app.get("/api/od-flows-tiered")
 def get_od_flows_tiered(oa: str):
-    """
-    Tiered OD flows:
-    - Same LA as origin OA: LSOA level (TYPE298)
-    - Outside LA: MSOA level (TYPE297), excluding MSOAs within origin LA
-    """
     try:
-        lookup_url = (
+        lookup_data = requests.get(
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-            "FeatureServer/0/query"
-            "?where=" + f"OA11CD='{oa}'" +
-            "&outFields=OA11CD,LSOA11CD,MSOA11CD,LAD11CD,LAD11NM"
-            "&f=json&resultRecordCount=1"
-        )
-        lookup_resp = requests.get(lookup_url, timeout=15)
-        lookup_data = lookup_resp.json()
+            "FeatureServer/0/query?where=" + f"OA11CD='{oa}'" +
+            "&outFields=OA11CD,LSOA11CD,MSOA11CD,LAD11CD,LAD11NM&f=json&resultRecordCount=1",
+            timeout=15).json()
 
         if not lookup_data.get("features"):
             return {"error": "Could not look up origin OA"}
@@ -239,95 +182,48 @@ def get_od_flows_tiered(oa: str):
         origin_lsoa = attrs.get("LSOA11CD")
         origin_msoa = attrs.get("MSOA11CD")
 
-        lsoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
-        lsoa_params = {
-            "date": "latest",
-            "currently_residing_in": oa,
-            "place_of_work": "TYPE298",
-            "measures": "20100",
-            "uid": NOMIS_API_KEY,
-            "select": "place_of_work_code,place_of_work_name,obs_value",
-            "ExcludeMissingValues": "true",
-        }
-        lsoa_resp = requests.get(lsoa_url, params=lsoa_params, timeout=60)
-        lsoa_data = lsoa_resp.json()
+        lsoa_data = requests.get("https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json", params={
+            "date": "latest", "currently_residing_in": oa, "place_of_work": "TYPE298",
+            "measures": "20100", "uid": NOMIS_API_KEY,
+            "select": "place_of_work_code,place_of_work_name,obs_value", "ExcludeMissingValues": "true",
+        }, timeout=60).json()
 
-        lsoa_in_la_url = (
+        local_lsoas = set(f["attributes"]["LSOA11CD"] for f in requests.get(
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-            "FeatureServer/0/query"
-            f"?where=LAD11CD='{origin_lad}'"
-            "&outFields=LSOA11CD"
-            "&returnDistinctValues=true"
-            "&f=json&resultRecordCount=2000"
-        )
-        lsoa_in_la_resp = requests.get(lsoa_in_la_url, timeout=15)
-        lsoa_in_la_data = lsoa_in_la_resp.json()
-        local_lsoas = set(
-            f["attributes"]["LSOA11CD"]
-            for f in lsoa_in_la_data.get("features", [])
-        )
+            f"FeatureServer/0/query?where=LAD11CD='{origin_lad}'"
+            "&outFields=LSOA11CD&returnDistinctValues=true&f=json&resultRecordCount=2000",
+            timeout=15).json().get("features", []))
 
-        msoa_url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json"
-        msoa_params = {
-            "date": "latest",
-            "currently_residing_in": oa,
-            "place_of_work": "TYPE297",
-            "measures": "20100",
-            "uid": NOMIS_API_KEY,
-            "select": "place_of_work_code,place_of_work_name,obs_value",
-            "ExcludeMissingValues": "true",
-        }
-        msoa_resp = requests.get(msoa_url, params=msoa_params, timeout=60)
-        msoa_data = msoa_resp.json()
+        msoa_data = requests.get("https://www.nomisweb.co.uk/api/v01/dataset/NM_1228_1.data.json", params={
+            "date": "latest", "currently_residing_in": oa, "place_of_work": "TYPE297",
+            "measures": "20100", "uid": NOMIS_API_KEY,
+            "select": "place_of_work_code,place_of_work_name,obs_value", "ExcludeMissingValues": "true",
+        }, timeout=60).json()
 
-        msoa_in_la_url = (
+        local_msoas = set(f["attributes"]["MSOA11CD"] for f in requests.get(
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-            "FeatureServer/0/query"
-            f"?where=LAD11CD='{origin_lad}'"
-            "&outFields=MSOA11CD"
-            "&returnDistinctValues=true"
-            "&f=json&resultRecordCount=500"
-        )
-        msoa_in_la_resp = requests.get(msoa_in_la_url, timeout=15)
-        msoa_in_la_data = msoa_in_la_resp.json()
-        local_msoas = set(
-            f["attributes"]["MSOA11CD"]
-            for f in msoa_in_la_data.get("features", [])
-        )
+            f"FeatureServer/0/query?where=LAD11CD='{origin_lad}'"
+            "&outFields=MSOA11CD&returnDistinctValues=true&f=json&resultRecordCount=500",
+            timeout=15).json().get("features", []))
 
-        flows = []
-        total_trips = 0
+        flows, total_trips = [], 0
 
         for item in lsoa_data.get("obs", []):
             dest_code = item.get("place_of_work", {}).get("geogcode", "")
             dest_name = item.get("place_of_work", {}).get("description", "")
             count = item.get("obs_value", {}).get("value", 0) or 0
-            if count == 0:
-                continue
-            if dest_code in local_lsoas:
-                flows.append({
-                    "destination": dest_code,
-                    "name": dest_name,
-                    "count": count,
-                    "type": "lsoa"
-                })
+            if count > 0 and dest_code in local_lsoas:
+                flows.append({"destination": dest_code, "name": dest_name, "count": count, "type": "lsoa"})
                 total_trips += count
 
         for item in msoa_data.get("obs", []):
             dest_code = item.get("place_of_work", {}).get("geogcode", "")
             dest_name = item.get("place_of_work", {}).get("description", "")
             count = item.get("obs_value", {}).get("value", 0) or 0
-            if count == 0:
-                continue
-            if dest_code not in local_msoas:
-                flows.append({
-                    "destination": dest_code,
-                    "name": dest_name,
-                    "count": count,
-                    "type": "msoa"
-                })
+            if count > 0 and dest_code not in local_msoas:
+                flows.append({"destination": dest_code, "name": dest_name, "count": count, "type": "msoa"})
                 total_trips += count
 
         for f in flows:
@@ -335,17 +231,12 @@ def get_od_flows_tiered(oa: str):
         flows.sort(key=lambda x: x["count"], reverse=True)
 
         return {
-            "origin_oa": oa,
-            "origin_lsoa": origin_lsoa,
-            "origin_msoa": origin_msoa,
-            "origin_lad": origin_lad,
-            "origin_lad_name": origin_lad_name,
-            "total_trips": total_trips,
-            "flows": flows,
+            "origin_oa": oa, "origin_lsoa": origin_lsoa, "origin_msoa": origin_msoa,
+            "origin_lad": origin_lad, "origin_lad_name": origin_lad_name,
+            "total_trips": total_trips, "flows": flows,
             "lsoa_count": sum(1 for f in flows if f["type"] == "lsoa"),
             "msoa_count": sum(1 for f in flows if f["type"] == "msoa"),
         }
-
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
@@ -354,45 +245,26 @@ def get_od_flows_tiered(oa: str):
 @app.get("/api/oa-within-msoa")
 def get_oa_within_msoa(msoa: str):
     try:
-        lookup_url = (
+        lookup_data = requests.get(
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
             "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-            "FeatureServer/0/query"
-            f"?where=MSOA11CD='{msoa}'"
-            "&outFields=OA11CD&f=json&resultRecordCount=500"
-        )
-        lookup_resp = requests.get(lookup_url, timeout=15)
-        lookup_data = lookup_resp.json()
-
+            f"FeatureServer/0/query?where=MSOA11CD='{msoa}'"
+            "&outFields=OA11CD&f=json&resultRecordCount=500", timeout=15).json()
         if not lookup_data.get('features'):
             return {"msoa": msoa, "oas": []}
-
         oa_codes = [f['attributes']['OA11CD'] for f in lookup_data['features']]
         codes_str = "','".join(oa_codes)
-
-        centroid_url = (
+        centroid_data = requests.get(
             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-            "Output_Areas_Dec_2011_PWC_2022/FeatureServer/0/query"
-            f"?where=OA11CD IN ('{codes_str}')"
-            "&outFields=OA11CD&outSR=4326&returnGeometry=true&f=json&resultRecordCount=500"
-        )
-        centroid_resp = requests.get(centroid_url, timeout=15)
-        centroid_data = centroid_resp.json()
-
+            f"Output_Areas_Dec_2011_PWC_2022/FeatureServer/0/query?where=OA11CD IN ('{codes_str}')"
+            "&outFields=OA11CD&outSR=4326&returnGeometry=true&f=json&resultRecordCount=500", timeout=15).json()
         oas = []
-        if centroid_data.get('features'):
-            for feat in centroid_data['features']:
-                oa_code = feat['attributes'].get('OA11CD')
-                geom = feat.get('geometry', {})
-                if oa_code and geom.get('x') and geom.get('y'):
-                    oas.append({
-                        'oa': oa_code,
-                        'lat': geom['y'],
-                        'lng': geom['x']
-                    })
-
+        for feat in centroid_data.get('features', []):
+            oa_code = feat['attributes'].get('OA11CD')
+            geom = feat.get('geometry', {})
+            if oa_code and geom.get('x') and geom.get('y'):
+                oas.append({'oa': oa_code, 'lat': geom['y'], 'lng': geom['x']})
         return {"msoa": msoa, "oa_count": len(oas), "oas": oas}
-
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
@@ -402,44 +274,30 @@ def get_oa_within_msoa(msoa: str):
 def get_mode_share(msoa: str):
     url = "https://www.nomisweb.co.uk/api/v01/dataset/NM_1208_1.data.json"
     params = {
-        "date": "latest",
-        "usual_residence": msoa,
-        "place_of_work": "TYPE297",
-        "transport_powpew11": "0,1,2,3,4,5,6,7,8,9,10,11",
-        "measures": "20100",
-        "uid": NOMIS_API_KEY,
-        "select": "transport_powpew11_code,transport_powpew11_name,obs_value",
+        "date": "latest", "usual_residence": msoa, "place_of_work": "TYPE297",
+        "transport_powpew11": "0,1,2,3,4,5,6,7,8,9,10,11", "measures": "20100",
+        "uid": NOMIS_API_KEY, "select": "transport_powpew11_code,transport_powpew11_name,obs_value",
     }
     try:
-        response = requests.get(url, params=params, timeout=30)
-        data = response.json()
+        data = requests.get(url, params=params, timeout=30).json()
         mode_names = {
-            0: "All", 1: "Work from home", 2: "Metro/tram",
-            3: "Train", 4: "Bus", 5: "Taxi", 6: "Motorcycle",
-            7: "Car driver", 8: "Car passenger", 9: "Bicycle",
-            10: "On foot", 11: "Other"
+            0: "All", 1: "Work from home", 2: "Metro/tram", 3: "Train", 4: "Bus",
+            5: "Taxi", 6: "Motorcycle", 7: "Car driver", 8: "Car passenger",
+            9: "Bicycle", 10: "On foot", 11: "Other"
         }
-        mode_totals = {}
-        total = 0
-        if "obs" in data:
-            for item in data["obs"]:
-                code = item.get("transport_powpew11", {}).get("value", -1)
-                count = item.get("obs_value", {}).get("value", 0) or 0
-                if code == 0:
-                    total += count
-                elif code in range(1, 12):
-                    mode_totals[code] = mode_totals.get(code, 0) + count
+        mode_totals, total = {}, 0
+        for item in data.get("obs", []):
+            code = item.get("transport_powpew11", {}).get("value", -1)
+            count = item.get("obs_value", {}).get("value", 0) or 0
+            if code == 0:
+                total += count
+            elif code in range(1, 12):
+                mode_totals[code] = mode_totals.get(code, 0) + count
         if total == 0:
             total = sum(mode_totals.values())
-        modes = []
-        for code in sorted(mode_totals.keys()):
-            count = mode_totals[code]
-            modes.append({
-                "code": code,
-                "name": mode_names.get(code, "Unknown"),
-                "count": count,
-                "percentage": round(count / total * 100, 1) if total > 0 else 0
-            })
+        modes = [{"code": c, "name": mode_names.get(c, "Unknown"), "count": mode_totals[c],
+                  "percentage": round(mode_totals[c] / total * 100, 1) if total > 0 else 0}
+                 for c in sorted(mode_totals)]
         return {"msoa": msoa, "total": total, "modes": modes}
     except Exception as e:
         return {"error": str(e)}
@@ -450,24 +308,15 @@ def get_oa_to_msoa(oa: str):
     url = (
         "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
         "OA11_LSOA11_MSOA11_LAD11_EW_LUv2_b3fe7c68f4b2420185eaff6284d4c125/"
-        "FeatureServer/0/query"
-        "?where=" + f"OA11CD='{oa}'" +
-        "&outFields=OA11CD,LSOA11CD,LSOA11NM,MSOA11CD,MSOA11NM"
-        "&f=json"
-        "&resultRecordCount=1"
+        "FeatureServer/0/query?where=" + f"OA11CD='{oa}'" +
+        "&outFields=OA11CD,LSOA11CD,LSOA11NM,MSOA11CD,MSOA11NM&f=json&resultRecordCount=1"
     )
     try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-        if "features" in data and len(data["features"]) > 0:
+        data = requests.get(url, timeout=15).json()
+        if "features" in data and data["features"]:
             attrs = data["features"][0]["attributes"]
-            return {
-                "oa": oa,
-                "lsoa": attrs.get("LSOA11CD"),
-                "lsoa_name": attrs.get("LSOA11NM"),
-                "msoa": attrs.get("MSOA11CD"),
-                "msoa_name": attrs.get("MSOA11NM")
-            }
+            return {"oa": oa, "lsoa": attrs.get("LSOA11CD"), "lsoa_name": attrs.get("LSOA11NM"),
+                    "msoa": attrs.get("MSOA11CD"), "msoa_name": attrs.get("MSOA11NM")}
         return {"oa": oa, "msoa": None}
     except Exception as e:
         return {"error": str(e)}
@@ -482,20 +331,14 @@ def get_road_network(pin_lat: float, pin_lng: float, polygon: str = None, radius
 
         if polygon:
             coords = json.loads(polygon)
-            shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
-            shapely_poly_buffered = shapely_poly.buffer(0.002)
-            G = ox.graph_from_polygon(shapely_poly_buffered, network_type='drive', simplify=True)
+            G = ox.graph_from_polygon(ShapelyPolygon([(p[1], p[0]) for p in coords]).buffer(0.002),
+                                      network_type='drive', simplify=True)
         else:
             G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
 
         nodes, edges = ox.graph_to_gdfs(G)
-        edges_reset = edges.reset_index()
-
         features = []
-        for _, row in edges_reset.iterrows():
-            name = clean_value(row.get('name'))
-            highway = clean_value(row.get('highway'))
-            maxspeed = clean_value(row.get('maxspeed'))
+        for _, row in edges.reset_index().iterrows():
             length = row.get('length', 0)
             try:
                 length = float(length)
@@ -505,26 +348,19 @@ def get_road_network(pin_lat: float, pin_lng: float, polygon: str = None, radius
                 length = 0
             features.append({
                 "type": "Feature",
-                "properties": {"name": name, "highway": highway, "length": length,
-                               "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False))},
+                "properties": {"name": clean_value(row.get('name')), "highway": clean_value(row.get('highway')),
+                               "length": length, "maxspeed": clean_value(row.get('maxspeed')),
+                               "oneway": bool(row.get('oneway', False))},
                 "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
             })
 
-        node_features = []
-        nodes_reset = nodes.reset_index()
-        for _, row in nodes_reset.iterrows():
-            node_features.append({
-                "type": "Feature",
-                "properties": {"osmid": int(row['osmid'])},
-                "geometry": {"type": "Point", "coordinates": [row['geometry'].x, row['geometry'].y]}
-            })
+        node_features = [{"type": "Feature", "properties": {"osmid": int(row['osmid'])},
+                          "geometry": {"type": "Point", "coordinates": [row['geometry'].x, row['geometry'].y]}}
+                         for _, row in nodes.reset_index().iterrows()]
 
-        return {
-            "edges": {"type": "FeatureCollection", "features": features},
-            "nodes": {"type": "FeatureCollection", "features": node_features},
-            "edge_count": len(features),
-            "node_count": len(node_features)
-        }
+        return {"edges": {"type": "FeatureCollection", "features": features},
+                "nodes": {"type": "FeatureCollection", "features": node_features},
+                "edge_count": len(features), "node_count": len(node_features)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -538,25 +374,18 @@ def split_edge(pin_lat: float, pin_lng: float, access_lat: float, access_lng: fl
 
         if polygon:
             coords = json.loads(polygon)
-            shapely_poly = ShapelyPolygon([(p[1], p[0]) for p in coords])
-            shapely_poly_buffered = shapely_poly.buffer(0.002)
-            G = ox.graph_from_polygon(shapely_poly_buffered, network_type='drive', simplify=True)
+            G = ox.graph_from_polygon(ShapelyPolygon([(p[1], p[0]) for p in coords]).buffer(0.002),
+                                      network_type='drive', simplify=True)
         else:
             G = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
 
         access_point = Point(access_lng, access_lat)
-        nearest = ox.nearest_edges(G, access_lng, access_lat)
-        u, v, k = nearest
+        u, v, k = ox.nearest_edges(G, access_lng, access_lat)
         edge_data = G[u][v][k]
-
-        if 'geometry' in edge_data:
-            line = edge_data['geometry']
-        else:
-            line = LineString([(G.nodes[u]['x'], G.nodes[u]['y']), (G.nodes[v]['x'], G.nodes[v]['y'])])
-
+        line = edge_data.get('geometry', LineString([(G.nodes[u]['x'], G.nodes[u]['y']),
+                                                      (G.nodes[v]['x'], G.nodes[v]['y'])]))
         nearest_pt = line.interpolate(line.project(access_point))
         return {"access_lat": nearest_pt.y, "access_lng": nearest_pt.x, "snapped": True, "edge": {"u": u, "v": v}}
-
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
@@ -581,7 +410,7 @@ def assign_trips(
         from shapely.geometry import Point, LineString, Polygon as ShapelyPolygon
         import json
 
-        # Build display network from polygon or radius
+        # Build display network
         shapely_poly_buffered = None
         if polygon:
             coords = json.loads(polygon)
@@ -593,29 +422,25 @@ def assign_trips(
             G_display = ox.graph_from_point((pin_lat, pin_lng), dist=radius_m, network_type='drive', simplify=True)
             print(f"Display network loaded from radius {radius_m}m")
 
-        # G_route is used for NetworkX fallback only — keep it small
-        routing_radius = min(radius_m * 2 if not polygon else 2000, 3000)
+        # Small NetworkX fallback network
+        routing_radius = min(2000 if polygon else radius_m * 2, 3000)
         G_route = ox.graph_from_point((pin_lat, pin_lng), dist=routing_radius, network_type='drive', simplify=True)
         G_route = ox.add_edge_speeds(G_route)
         G_route = ox.add_edge_travel_times(G_route)
         print(f"Routing network loaded ({routing_radius}m fallback)")
 
-        # Set up origin node for NetworkX fallback
+        # Set up origin node
         if access_lat and access_lng:
             u, v, k = ox.nearest_edges(G_route, access_lng, access_lat)
             edge_data = G_route[u][v][k]
-
-            if 'geometry' in edge_data:
-                line = edge_data['geometry']
-            else:
-                line = LineString([(G_route.nodes[u]['x'], G_route.nodes[u]['y']),
-                                   (G_route.nodes[v]['x'], G_route.nodes[v]['y'])])
-
+            line = edge_data.get('geometry', LineString([
+                (G_route.nodes[u]['x'], G_route.nodes[u]['y']),
+                (G_route.nodes[v]['x'], G_route.nodes[v]['y'])
+            ]))
             snapped = line.interpolate(line.project(Point(access_lng, access_lat)))
             new_lng, new_lat = snapped.x, snapped.y
             new_node_id = 999999999
             G_route.add_node(new_node_id, x=new_lng, y=new_lat)
-
             speed = edge_data.get('speed_kph', 50)
             if not speed or (isinstance(speed, float) and math.isnan(speed)):
                 speed = 50
@@ -627,77 +452,48 @@ def assign_trips(
             dist_v = dist_m(new_lng, new_lat, G_route.nodes[v]['x'], G_route.nodes[v]['y'])
             tt_u = dist_u / (speed * 1000 / 3600)
             tt_v = dist_v / (speed * 1000 / 3600)
-
             G_route.add_edge(new_node_id, u, 0, travel_time=tt_u, length=dist_u,
-                      geometry=LineString([(new_lng, new_lat), (G_route.nodes[u]['x'], G_route.nodes[u]['y'])]))
+                geometry=LineString([(new_lng, new_lat), (G_route.nodes[u]['x'], G_route.nodes[u]['y'])]))
             G_route.add_edge(u, new_node_id, 0, travel_time=tt_u, length=dist_u,
-                      geometry=LineString([(G_route.nodes[u]['x'], G_route.nodes[u]['y']), (new_lng, new_lat)]))
+                geometry=LineString([(G_route.nodes[u]['x'], G_route.nodes[u]['y']), (new_lng, new_lat)]))
             G_route.add_edge(new_node_id, v, 0, travel_time=tt_v, length=dist_v,
-                      geometry=LineString([(new_lng, new_lat), (G_route.nodes[v]['x'], G_route.nodes[v]['y'])]))
+                geometry=LineString([(new_lng, new_lat), (G_route.nodes[v]['x'], G_route.nodes[v]['y'])]))
             G_route.add_edge(v, new_node_id, 0, travel_time=tt_v, length=dist_v,
-                      geometry=LineString([(G_route.nodes[v]['x'], G_route.nodes[v]['y']), (new_lng, new_lat)]))
-
+                geometry=LineString([(G_route.nodes[v]['x'], G_route.nodes[v]['y']), (new_lng, new_lat)]))
             origin_node = new_node_id
             print(f"Access node at ({new_lat:.5f},{new_lng:.5f}), connected to {u} and {v}")
         else:
             origin_node = ox.nearest_nodes(G_route, pin_lng, pin_lat)
-            print(f"Using nearest node: {origin_node}")
 
-        # Determine origin coordinates for HERE routing
-        if access_lat and access_lng:
-            origin_lat_coord = access_lat
-            origin_lng_coord = access_lng
-        else:
-            origin_lat_coord = pin_lat
-            origin_lng_coord = pin_lng
+        origin_lat_coord = access_lat if access_lat else pin_lat
+        origin_lng_coord = access_lng if access_lng else pin_lng
 
-        # Parse flows string
+        # Parse flows
         flow_list = []
         if flows:
             for item in flows.split(','):
                 parts = item.strip().split(':')
-                if len(parts) == 4:
+                if len(parts) == 2:
                     try:
-                        flow_list.append({
-                            'msoa': parts[0].strip(),
-                            'percentage': float(parts[1].strip()),
-                            'dest_lat': float(parts[2].strip()),
-                            'dest_lng': float(parts[3].strip())
-                        })
+                        flow_list.append({'msoa': parts[0].strip(), 'percentage': float(parts[1].strip()),
+                                          'dest_lat': None, 'dest_lng': None})
                     except:
                         pass
-                elif len(parts) == 2:
-                    try:
-                        flow_list.append({
-                            'msoa': parts[0].strip(),
-                            'percentage': float(parts[1].strip()),
-                            'dest_lat': None,
-                            'dest_lng': None
-                        })
-                    except:
-                        pass
-
-        # Initialise edge trip counts from G_display
-        edge_trips_route = {}
-        for uu, vv, kk in G_display.edges(keys=True):
-            edge_trips_route[(uu, vv, kk)] = 0
 
         total_assigned = 0
+        route_features = []  # HERE polyline features for direct display
 
         for flow in flow_list:
             msoa = flow['msoa']
             pct = flow['percentage']
-            trips_to_dest = round(vehicle_trips * pct / 100)
-            if trips_to_dest == 0:
-                trips_to_dest = 1  # assign at least 1 trip to any destination with a percentage
             if pct == 0:
                 continue
+            trips_to_dest = max(1, round(vehicle_trips * pct / 100))
 
             try:
                 dest_lat = flow.get('dest_lat')
                 dest_lng = flow.get('dest_lng')
 
-                # Look up centroid if not provided
                 if not dest_lat or not dest_lng:
                     zone_code = msoa
                     if zone_code.startswith('E02') or zone_code.startswith('W02'):
@@ -707,32 +503,36 @@ def assign_trips(
                             f"?where=msoa11cd='{zone_code}'&outFields=msoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
                         )
                     else:
-                        # LSOA centroid lookup
                         centroid_url = (
                             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
                             "LSOA_Dec_2011_PWC_in_England_and_Wales_2022/FeatureServer/0/query"
                             f"?where=LSOA11CD='{zone_code}'&outFields=LSOA11CD&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
                         )
-                    centroid_resp = requests.get(centroid_url, timeout=10)
-                    centroid_data = centroid_resp.json()
+                    centroid_data = requests.get(centroid_url, timeout=10).json()
                     if not centroid_data.get('features'):
                         print(f"No centroid found for {zone_code}")
                         continue
-                    feature = centroid_data['features'][0]
-                    geom = feature.get('geometry', {})
+                    geom = centroid_data['features'][0].get('geometry', {})
                     dest_lng = geom.get('x')
                     dest_lat = geom.get('y')
                     if not dest_lat or not dest_lng:
                         continue
 
-                # Use HERE routing if API key available, else fall back to NetworkX
+                # Use HERE routing — return polyline directly
                 if HERE_API_KEY:
                     departure_time = am_peak if assign_period != 'pm' else pm_peak
                     here_coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
                     if here_coords:
-                        match_polyline_to_edges(here_coords, G_display, edge_trips_route, trips_to_dest, shapely_poly_buffered)
+                        clipped = clip_polyline_to_polygon(here_coords, shapely_poly_buffered)
+                        if len(clipped) >= 2:
+                            route_features.append({
+                                "type": "Feature",
+                                "properties": {"trips": trips_to_dest, "destination": msoa},
+                                "geometry": {"type": "LineString",
+                                             "coordinates": [[lng, lat] for lat, lng in clipped]}
+                            })
                         total_assigned += trips_to_dest
-                        print(f"HERE routed {trips_to_dest} trips to {msoa} via {len(here_coords)} coords")
+                        print(f"HERE routed {trips_to_dest} trips to {msoa} ({len(clipped)} clipped coords)")
                         continue
 
                 # NetworkX fallback
@@ -743,30 +543,17 @@ def assign_trips(
                     path = nx.shortest_path(G_route, origin_node, dest_node, weight='travel_time')
                 except nx.NetworkXNoPath:
                     try:
-                        G_undirected = G_route.to_undirected()
-                        path = nx.shortest_path(G_undirected, origin_node, dest_node, weight='travel_time')
+                        path = nx.shortest_path(G_route.to_undirected(), origin_node, dest_node, weight='travel_time')
                     except:
                         continue
                 if len(path) < 2:
                     continue
-
-                # Match NetworkX path to G_display edges
-                for i in range(len(path) - 1):
-                    node_a, node_b = path[i], path[i + 1]
-                    # Find nearest display edge to midpoint of this path segment
-                    try:
-                        ax = G_route.nodes[node_a]['x']
-                        ay = G_route.nodes[node_a]['y']
-                        bx = G_route.nodes[node_b]['x']
-                        by = G_route.nodes[node_b]['y']
-                        mid_x = (ax + bx) / 2
-                        mid_y = (ay + by) / 2
-                        du, dv, dk = ox.nearest_edges(G_display, mid_x, mid_y)
-                        edge_key = (du, dv, dk)
-                        edge_trips_route[edge_key] = edge_trips_route.get(edge_key, 0) + trips_to_dest
-                    except Exception:
-                        continue
-
+                path_coords = [[G_route.nodes[n]['x'], G_route.nodes[n]['y']] for n in path]
+                route_features.append({
+                    "type": "Feature",
+                    "properties": {"trips": trips_to_dest, "destination": msoa},
+                    "geometry": {"type": "LineString", "coordinates": path_coords}
+                })
                 total_assigned += trips_to_dest
                 print(f"NetworkX routed {trips_to_dest} trips to {msoa} via {len(path)} nodes")
 
@@ -776,15 +563,9 @@ def assign_trips(
 
         print(f"Total assigned: {total_assigned}")
 
-        # Build output features from G_display with trip counts
-        nodes_display, edges_display = ox.graph_to_gdfs(G_display)
-        edges_reset = edges_display.reset_index()
-
-        features = []
-        for _, row in edges_reset.iterrows():
-            name = clean_value(row.get('name'))
-            highway = clean_value(row.get('highway'))
-            maxspeed = clean_value(row.get('maxspeed'))
+        # Build base road network for display context
+        base_features = []
+        for _, row in ox.graph_to_gdfs(G_display)[1].reset_index().iterrows():
             length = row.get('length', 0)
             try:
                 length = float(length)
@@ -792,24 +573,19 @@ def assign_trips(
                     length = 0
             except:
                 length = 0
-
-            u_disp = row['u']
-            v_disp = row['v']
-            trips = edge_trips_route.get((u_disp, v_disp, 0), 0)
-
-            features.append({
+            base_features.append({
                 "type": "Feature",
-                "properties": {
-                    "name": name, "highway": highway, "length": length,
-                    "maxspeed": maxspeed, "oneway": bool(row.get('oneway', False)),
-                    "trips": trips
-                },
+                "properties": {"name": clean_value(row.get('name')), "highway": clean_value(row.get('highway')),
+                               "length": length, "maxspeed": clean_value(row.get('maxspeed')),
+                               "oneway": bool(row.get('oneway', False)), "trips": 0},
                 "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
             })
 
         return {
-            "edges": {"type": "FeatureCollection", "features": features},
-            "edge_count": len(features),
+            "edges": {"type": "FeatureCollection", "features": base_features},
+            "routes": {"type": "FeatureCollection", "features": route_features},
+            "edge_count": len(base_features),
+            "route_count": len(route_features),
             "node_count": len(G_display.nodes),
             "total_assigned": total_assigned,
             "origin_node": origin_node
