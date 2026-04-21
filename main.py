@@ -704,8 +704,8 @@ def assign_trips(
                         # LSOA centroid lookup
                         centroid_url = (
                             "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
-                            "LSOA_Dec_2011_PWC_in_England_and_Wales/FeatureServer/0/query"
-                            f"?where=lsoa11cd='{zone_code}'&outFields=lsoa11cd&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
+                            "LSOA_Dec_2011_PWC_2022/FeatureServer/0/query"
+                            f"?where=LSOA11CD='{zone_code}'&outFields=LSOA11CD&returnGeometry=true&outSR=4326&f=json&resultRecordCount=1"
                         )
                     centroid_resp = requests.get(centroid_url, timeout=10)
                     centroid_data = centroid_resp.json()
