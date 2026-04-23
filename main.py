@@ -657,14 +657,25 @@ def assign_trips(
                 key = (min(a, b), max(a, b))
                 segment_trips[key] = segment_trips.get(key, 0) + trips
 
-        aggregated_features = [
-            {
+        # Snap each aggregated segment to nearest OSM edge to get road name
+        aggregated_features = []
+        for key, trips in segment_trips.items():
+            mid_lng = (key[0][0] + key[1][0]) / 2
+            mid_lat = (key[0][1] + key[1][1]) / 2
+            road_name = None
+            highway = None
+            try:
+                u, v, k = ox.nearest_edges(G_display, mid_lng, mid_lat)
+                edge_data = G_display[u][v][k]
+                road_name = clean_value(edge_data.get('name'))
+                highway = clean_value(edge_data.get('highway'))
+            except Exception:
+                pass
+            aggregated_features.append({
                 "type": "Feature",
-                "properties": {"trips": trips},
+                "properties": {"trips": trips, "name": road_name, "highway": highway},
                 "geometry": {"type": "LineString", "coordinates": [list(key[0]), list(key[1])]}
-            }
-            for key, trips in segment_trips.items()
-        ]
+            })
 
         return {
             "edges": {"type": "FeatureCollection", "features": base_features},
