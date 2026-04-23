@@ -397,6 +397,8 @@ def assign_trips(
     radius_m: int = 1000,
     polygon: str = None,
     vehicle_trips: int = 0,
+    arr_vehicle_trips: int = 0,
+    dep_vehicle_trips: int = 0,
     flows: str = "",
     access_lat: float = None,
     access_lng: float = None,
@@ -483,12 +485,59 @@ def assign_trips(
         total_assigned = 0
         route_features = []  # HERE polyline features for direct display
 
+        # Use split arr/dep if provided, otherwise fall back to single vehicle_trips total
+        use_split = (arr_vehicle_trips > 0 or dep_vehicle_trips > 0)
+        departure_time = am_peak if assign_period != 'pm' else pm_peak
+
+        def route_one(msoa, pct, trips, origin_lat, origin_lng, dest_lat, dest_lng, direction):
+            """Route trips in one direction and append to route_features. Returns trips assigned."""
+            if trips == 0 or pct == 0:
+                return 0
+            try:
+                if HERE_API_KEY:
+                    here_coords = here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time)
+                    if here_coords:
+                        clipped = clip_polyline_to_polygon(here_coords, shapely_poly_buffered)
+                        if len(clipped) >= 2:
+                            route_features.append({
+                                "type": "Feature",
+                                "properties": {"trips": trips, "destination": msoa, "direction": direction},
+                                "geometry": {"type": "LineString",
+                                             "coordinates": [[lng, lat] for lat, lng in clipped]}
+                            })
+                        print(f"HERE {direction} {trips} trips to {msoa} ({len(clipped)} coords)")
+                        return trips
+
+                # NetworkX fallback
+                dest_node = ox.nearest_nodes(G_route, dest_lng, dest_lat)
+                if dest_node == origin_node:
+                    return 0
+                try:
+                    path = nx.shortest_path(G_route, origin_node, dest_node, weight='travel_time')
+                except nx.NetworkXNoPath:
+                    try:
+                        path = nx.shortest_path(G_route.to_undirected(), origin_node, dest_node, weight='travel_time')
+                    except:
+                        return 0
+                if len(path) < 2:
+                    return 0
+                path_coords = [[G_route.nodes[n]['x'], G_route.nodes[n]['y']] for n in path]
+                route_features.append({
+                    "type": "Feature",
+                    "properties": {"trips": trips, "destination": msoa, "direction": direction},
+                    "geometry": {"type": "LineString", "coordinates": path_coords}
+                })
+                print(f"NetworkX {direction} {trips} trips to {msoa} via {len(path)} nodes")
+                return trips
+            except Exception as e:
+                print(f"Error routing {direction} to {msoa}: {e}")
+                return 0
+
         for flow in flow_list:
             msoa = flow['msoa']
             pct = flow['percentage']
             if pct == 0:
                 continue
-            trips_to_dest = max(1, round(vehicle_trips * pct / 100))
 
             try:
                 dest_lat = flow.get('dest_lat')
@@ -518,44 +567,17 @@ def assign_trips(
                     if not dest_lat or not dest_lng:
                         continue
 
-                # Use HERE routing — return polyline directly
-                if HERE_API_KEY:
-                    departure_time = am_peak if assign_period != 'pm' else pm_peak
-                    here_coords = here_route(origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, departure_time)
-                    if here_coords:
-                        clipped = clip_polyline_to_polygon(here_coords, shapely_poly_buffered)
-                        if len(clipped) >= 2:
-                            route_features.append({
-                                "type": "Feature",
-                                "properties": {"trips": trips_to_dest, "destination": msoa},
-                                "geometry": {"type": "LineString",
-                                             "coordinates": [[lng, lat] for lat, lng in clipped]}
-                            })
-                        total_assigned += trips_to_dest
-                        print(f"HERE routed {trips_to_dest} trips to {msoa} ({len(clipped)} clipped coords)")
-                        continue
-
-                # NetworkX fallback
-                dest_node = ox.nearest_nodes(G_route, dest_lng, dest_lat)
-                if dest_node == origin_node:
-                    continue
-                try:
-                    path = nx.shortest_path(G_route, origin_node, dest_node, weight='travel_time')
-                except nx.NetworkXNoPath:
-                    try:
-                        path = nx.shortest_path(G_route.to_undirected(), origin_node, dest_node, weight='travel_time')
-                    except:
-                        continue
-                if len(path) < 2:
-                    continue
-                path_coords = [[G_route.nodes[n]['x'], G_route.nodes[n]['y']] for n in path]
-                route_features.append({
-                    "type": "Feature",
-                    "properties": {"trips": trips_to_dest, "destination": msoa},
-                    "geometry": {"type": "LineString", "coordinates": path_coords}
-                })
-                total_assigned += trips_to_dest
-                print(f"NetworkX routed {trips_to_dest} trips to {msoa} via {len(path)} nodes")
+                if use_split:
+                    # Arrivals: destination → site
+                    arr_trips = max(1, round(arr_vehicle_trips * pct / 100)) if arr_vehicle_trips > 0 else 0
+                    total_assigned += route_one(msoa, pct, arr_trips, dest_lat, dest_lng, origin_lat_coord, origin_lng_coord, 'arrivals')
+                    # Departures: site → destination
+                    dep_trips = max(1, round(dep_vehicle_trips * pct / 100)) if dep_vehicle_trips > 0 else 0
+                    total_assigned += route_one(msoa, pct, dep_trips, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
+                else:
+                    # Legacy: all trips site → destination
+                    trips_to_dest = max(1, round(vehicle_trips * pct / 100))
+                    total_assigned += route_one(msoa, pct, trips_to_dest, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
 
             except Exception as e:
                 print(f"Error routing to {msoa}: {e}")
