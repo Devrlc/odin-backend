@@ -603,6 +603,9 @@ def assign_trips(
                 "geometry": {"type": "LineString", "coordinates": list(row['geometry'].coords)}
             })
 
+        arr_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "arrivals")
+        dep_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "departures")
+
         return {
             "edges": {"type": "FeatureCollection", "features": base_features},
             "routes": {"type": "FeatureCollection", "features": route_features},
@@ -610,6 +613,8 @@ def assign_trips(
             "route_count": len(route_features),
             "node_count": len(G_display.nodes),
             "total_assigned": total_assigned,
+            "arr_assigned": arr_assigned,
+            "dep_assigned": dep_assigned,
             "origin_node": origin_node
         }
 
