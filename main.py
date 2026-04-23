@@ -397,8 +397,9 @@ def assign_trips(
     radius_m: int = 1000,
     polygon: str = None,
     vehicle_trips: int = 0,
-    arr_vehicle_trips: int = 0,
-    dep_vehicle_trips: int = 0,
+    arr_person_trips: int = 0,
+    dep_person_trips: int = 0,
+    car_pct: float = 0.0,
     flows: str = "",
     access_lat: float = None,
     access_lng: float = None,
@@ -470,32 +471,48 @@ def assign_trips(
         origin_lat_coord = access_lat if access_lat else pin_lat
         origin_lng_coord = access_lng if access_lng else pin_lng
 
-        # Parse flows
+        # Parse flows — format is "zone:count:total" for new methodology
+        # or "zone:percentage" for legacy
         flow_list = []
         if flows:
             for item in flows.split(','):
                 parts = item.strip().split(':')
-                if len(parts) == 2:
+                if len(parts) == 3:
                     try:
-                        flow_list.append({'msoa': parts[0].strip(), 'percentage': float(parts[1].strip()),
-                                          'dest_lat': None, 'dest_lng': None})
+                        flow_list.append({
+                            'msoa': parts[0].strip(),
+                            'count': int(parts[1].strip()),
+                            'total': int(parts[2].strip()),
+                            'dest_lat': None, 'dest_lng': None
+                        })
+                    except:
+                        pass
+                elif len(parts) == 2:
+                    # Legacy percentage format
+                    try:
+                        flow_list.append({
+                            'msoa': parts[0].strip(),
+                            'count': None,
+                            'total': None,
+                            'percentage': float(parts[1].strip()),
+                            'dest_lat': None, 'dest_lng': None
+                        })
                     except:
                         pass
 
-        total_assigned = 0
-        route_features = []  # HERE polyline features for direct display
-
-        # Use split arr/dep if provided, otherwise fall back to single vehicle_trips total
-        use_split = (arr_vehicle_trips > 0 or dep_vehicle_trips > 0)
+        use_split = (arr_person_trips > 0 or dep_person_trips > 0)
         departure_time = am_peak if assign_period != 'pm' else pm_peak
 
-        def route_one(msoa, pct, trips, origin_lat, origin_lng, dest_lat, dest_lng, direction):
-            """Route trips in one direction and append to route_features. Returns trips assigned."""
-            if trips == 0 or pct == 0:
+        total_assigned = 0
+        route_features = []
+
+        def route_one(msoa, trips, o_lat, o_lng, d_lat, d_lng, direction):
+            """Route trips in one direction, append to route_features. Returns trips assigned."""
+            if trips <= 0:
                 return 0
             try:
                 if HERE_API_KEY:
-                    here_coords = here_route(origin_lat, origin_lng, dest_lat, dest_lng, departure_time)
+                    here_coords = here_route(o_lat, o_lng, d_lat, d_lng, departure_time)
                     if here_coords:
                         clipped = clip_polyline_to_polygon(here_coords, shapely_poly_buffered)
                         if len(clipped) >= 2:
@@ -509,7 +526,7 @@ def assign_trips(
                         return trips
 
                 # NetworkX fallback
-                dest_node = ox.nearest_nodes(G_route, dest_lng, dest_lat)
+                dest_node = ox.nearest_nodes(G_route, d_lng, d_lat)
                 if dest_node == origin_node:
                     return 0
                 try:
@@ -535,8 +552,32 @@ def assign_trips(
 
         for flow in flow_list:
             msoa = flow['msoa']
-            pct = flow['percentage']
-            if pct == 0:
+            count = flow.get('count')
+            total_census = flow.get('total')
+            percentage = flow.get('percentage')
+
+            if count is not None and total_census and total_census > 0:
+                # New methodology: person trips × (census count / total census) × car%
+                if use_split:
+                    arr_person_to_dest = arr_person_trips * count / total_census
+                    dep_person_to_dest = dep_person_trips * count / total_census
+                    arr_trips = round(arr_person_to_dest * car_pct)
+                    dep_trips = round(dep_person_to_dest * car_pct)
+                else:
+                    # Legacy single direction
+                    trips_to_dest = round(vehicle_trips * count / total_census)
+                    arr_trips = 0
+                    dep_trips = trips_to_dest
+            elif percentage is not None:
+                # Legacy percentage fallback
+                if use_split:
+                    arr_trips = round(arr_person_trips * percentage / 100 * car_pct)
+                    dep_trips = round(dep_person_trips * percentage / 100 * car_pct)
+                else:
+                    trips_to_dest = round(vehicle_trips * percentage / 100)
+                    arr_trips = 0
+                    dep_trips = trips_to_dest
+            else:
                 continue
 
             try:
@@ -568,18 +609,15 @@ def assign_trips(
                         continue
 
                 if use_split:
-                    # Arrivals: destination → site (ceil for worst case)
-                    arr_trips = math.ceil(arr_vehicle_trips * pct / 100) if arr_vehicle_trips > 0 else 0
-                    total_assigned += route_one(msoa, pct, arr_trips, dest_lat, dest_lng, origin_lat_coord, origin_lng_coord, 'arrivals')
-                    # Departures: site → destination (ceil for worst case)
-                    dep_trips = math.ceil(dep_vehicle_trips * pct / 100) if dep_vehicle_trips > 0 else 0
-                    total_assigned += route_one(msoa, pct, dep_trips, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
+                    # Arrivals: destination → site
+                    if arr_trips > 0:
+                        total_assigned += route_one(msoa, arr_trips, dest_lat, dest_lng, origin_lat_coord, origin_lng_coord, 'arrivals')
+                    # Departures: site → destination
+                    if dep_trips > 0:
+                        total_assigned += route_one(msoa, dep_trips, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
                 else:
-                    # Legacy: all trips site → destination (ceil for worst case)
-                    trips_to_dest = math.ceil(vehicle_trips * pct / 100)
-                    if trips_to_dest == 0:
-                        continue
-                    total_assigned += route_one(msoa, pct, trips_to_dest, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
+                    if dep_trips > 0:
+                        total_assigned += route_one(msoa, dep_trips, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
 
             except Exception as e:
                 print(f"Error routing to {msoa}: {e}")
@@ -608,8 +646,7 @@ def assign_trips(
         arr_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "arrivals")
         dep_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "departures")
 
-        # Build aggregated link totals from HERE polylines directly
-        # Round coords to 5dp (~1m precision) to create consistent segment keys
+        # Build aggregated link totals directly from HERE polylines
         segment_trips = {}
         for feature in route_features:
             trips = feature["properties"]["trips"]
@@ -617,19 +654,14 @@ def assign_trips(
             for i in range(len(coords) - 1):
                 a = (round(coords[i][0], 5), round(coords[i][1], 5))
                 b = (round(coords[i+1][0], 5), round(coords[i+1][1], 5))
-                # Normalise direction so A->B and B->A are the same segment
                 key = (min(a, b), max(a, b))
                 segment_trips[key] = segment_trips.get(key, 0) + trips
 
-        # Build aggregated GeoJSON features
         aggregated_features = [
             {
                 "type": "Feature",
                 "properties": {"trips": trips},
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": [list(key[0]), list(key[1])]
-                }
+                "geometry": {"type": "LineString", "coordinates": [list(key[0]), list(key[1])]}
             }
             for key, trips in segment_trips.items()
         ]
