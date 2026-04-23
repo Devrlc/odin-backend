@@ -568,15 +568,17 @@ def assign_trips(
                         continue
 
                 if use_split:
-                    # Arrivals: destination → site
-                    arr_trips = max(1, round(arr_vehicle_trips * pct / 100)) if arr_vehicle_trips > 0 else 0
+                    # Arrivals: destination → site (ceil for worst case)
+                    arr_trips = math.ceil(arr_vehicle_trips * pct / 100) if arr_vehicle_trips > 0 else 0
                     total_assigned += route_one(msoa, pct, arr_trips, dest_lat, dest_lng, origin_lat_coord, origin_lng_coord, 'arrivals')
-                    # Departures: site → destination
-                    dep_trips = max(1, round(dep_vehicle_trips * pct / 100)) if dep_vehicle_trips > 0 else 0
+                    # Departures: site → destination (ceil for worst case)
+                    dep_trips = math.ceil(dep_vehicle_trips * pct / 100) if dep_vehicle_trips > 0 else 0
                     total_assigned += route_one(msoa, pct, dep_trips, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
                 else:
-                    # Legacy: all trips site → destination
-                    trips_to_dest = max(1, round(vehicle_trips * pct / 100))
+                    # Legacy: all trips site → destination (ceil for worst case)
+                    trips_to_dest = math.ceil(vehicle_trips * pct / 100)
+                    if trips_to_dest == 0:
+                        continue
                     total_assigned += route_one(msoa, pct, trips_to_dest, origin_lat_coord, origin_lng_coord, dest_lat, dest_lng, 'departures')
 
             except Exception as e:
