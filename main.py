@@ -608,11 +608,39 @@ def assign_trips(
         arr_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "arrivals")
         dep_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "departures")
 
+        # Build aggregated link totals from HERE polylines directly
+        # Round coords to 5dp (~1m precision) to create consistent segment keys
+        segment_trips = {}
+        for feature in route_features:
+            trips = feature["properties"]["trips"]
+            coords = feature["geometry"]["coordinates"]
+            for i in range(len(coords) - 1):
+                a = (round(coords[i][0], 5), round(coords[i][1], 5))
+                b = (round(coords[i+1][0], 5), round(coords[i+1][1], 5))
+                # Normalise direction so A->B and B->A are the same segment
+                key = (min(a, b), max(a, b))
+                segment_trips[key] = segment_trips.get(key, 0) + trips
+
+        # Build aggregated GeoJSON features
+        aggregated_features = [
+            {
+                "type": "Feature",
+                "properties": {"trips": trips},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [list(key[0]), list(key[1])]
+                }
+            }
+            for key, trips in segment_trips.items()
+        ]
+
         return {
             "edges": {"type": "FeatureCollection", "features": base_features},
             "routes": {"type": "FeatureCollection", "features": route_features},
+            "aggregated": {"type": "FeatureCollection", "features": aggregated_features},
             "edge_count": len(base_features),
             "route_count": len(route_features),
+            "aggregated_count": len(aggregated_features),
             "node_count": len(G_display.nodes),
             "total_assigned": total_assigned,
             "arr_assigned": arr_assigned,
