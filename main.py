@@ -647,15 +647,30 @@ def assign_trips(
         dep_assigned = sum(f["properties"]["trips"] for f in route_features if f["properties"].get("direction") == "departures")
 
         # Build aggregated link totals directly from HERE polylines
-        segment_trips = {}
-        for feature in route_features:
-            trips = feature["properties"]["trips"]
-            coords = feature["geometry"]["coordinates"]
-            for i in range(len(coords) - 1):
-                a = (round(coords[i][0], 5), round(coords[i][1], 5))
-                b = (round(coords[i+1][0], 5), round(coords[i+1][1], 5))
-                key = (min(a, b), max(a, b))
-                segment_trips[key] = segment_trips.get(key, 0) + trips
+        aggregated_features = []
+        for key, data in segment_trips.items():
+            mid_lng = (key[0][0] + key[1][0]) / 2
+            mid_lat = (key[0][1] + key[1][1]) / 2
+            road_name = None
+            highway = None
+            try:
+                u, v, k = ox.nearest_edges(G_display, mid_lng, mid_lat)
+                edge_data = G_display[u][v][k]
+                road_name = clean_value(edge_data.get('name'))
+                highway = clean_value(edge_data.get('highway'))
+            except Exception:
+                pass
+            aggregated_features.append({
+                "type": "Feature",
+                "properties": {
+                    "trips": data["total"],
+                    "arrivals": data["arrivals"],
+                    "departures": data["departures"],
+                    "name": road_name,
+                    "highway": highway
+                },
+                "geometry": {"type": "LineString", "coordinates": [list(key[0]), list(key[1])]}
+            })
 
         # Snap each aggregated segment to nearest OSM edge to get road name
         aggregated_features = []
